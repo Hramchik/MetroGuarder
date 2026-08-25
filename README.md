@@ -28,13 +28,17 @@ DB Netz AG, CC-BY 4.0): 30 кадров, три сцены — прямой пе
 ## Быстрый старт
 
 ```bash
-# 1. Данные (три последовательности, ~2.2 ГБ)
+# 1. Данные (три последовательности, ~2.2 ГБ) — качаются с хоста
 ./scripts/download_osdar23.sh
 
-# 2. Сборка (ROS 2 Humble)
-cd ros2_ws && colcon build --symlink-install && source install/setup.bash
+# 2. Сборка и запуск — в окружении с ROS 2 Humble.
+#    На этой машине это distrobox-контейнер ros-gazebo:
+distrobox enter ros-gazebo
+source /opt/ros/humble/setup.bash
+cd ~/Projects/metro-lidar-guard/ros2_ws
+colcon build --symlink-install && source install/setup.bash
 
-# 3. Запуск: воспроизведение записи + мониторинг + RViz
+# 3. Воспроизведение записи + мониторинг + RViz
 ros2 launch rail_guard_bringup replay_osdar23.launch.py \
     sequence:=$PWD/../data/osdar23/sequences/9_station_ruebenkamp_9.1 \
     config:=$PWD/src/rail_guard_bringup/config/osdar23.yaml
@@ -44,7 +48,10 @@ ros2 launch rail_guard_bringup replay_osdar23.launch.py \
 только та часть, что подтверждена рельсами), рамки препятствий с классом,
 дальностью и уверенностью, и текущее решение.
 
-Без ROS, только алгоритм и метрики:
+Без ROS, только алгоритм и метрики. Эти скрипты запускаются **с хоста**: если
+numpy и scipy найдены только в контейнере, они сами перезапускаются в нём
+(контейнер задаётся переменной `RAIL_GUARD_CONTAINER`, по умолчанию
+`ros-gazebo`):
 
 ```bash
 python3 scripts/run_offline.py --sequence 9_station_ruebenkamp_9.1 \

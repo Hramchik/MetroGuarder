@@ -8,6 +8,23 @@ OUT="$ROOT/docs/benchmark_output.txt"
 SEQUENCES=(7_approach_underground_station_7.1 9_station_ruebenkamp_9.1 15_construction_vehicle_15.1)
 PY=${PYTHON:-python3}
 
+# numpy и scipy стоят только в контейнере с ROS — если их нет, перезапускаем
+# весь прогон внутри него одним заходом, а не по разу на каждый скрипт.
+CONTAINER=${RAIL_GUARD_CONTAINER:-ros-gazebo}
+if ! "$PY" -c "import numpy, scipy" >/dev/null 2>&1; then
+  if [ -n "${RAIL_GUARD_REEXEC:-}" ]; then
+    echo "numpy/scipy недоступны даже в контейнере «$CONTAINER»" >&2
+    exit 1
+  fi
+  if ! command -v distrobox >/dev/null 2>&1; then
+    echo "Нужны numpy и scipy: запустите прогон в окружении с ROS 2" >&2
+    exit 1
+  fi
+  echo "[rail-guard] numpy на хосте нет — прогон идёт в distrobox «$CONTAINER»" >&2
+  exec distrobox enter "$CONTAINER" -- bash -lc \
+    "env RAIL_GUARD_REEXEC=1 $(printf '%q' "${BASH_SOURCE[0]}") $(printf '%q ' "$@")"
+fi
+
 exec > >(tee "$OUT") 2>&1
 echo "Прогон метрик $(date -Iseconds)"
 echo "Конфигурация: $CFG"

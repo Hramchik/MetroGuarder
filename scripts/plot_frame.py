@@ -4,6 +4,11 @@
 
     python3 scripts/plot_frame.py --sequence 7_approach_underground_station_7.1 --frame 9
 """
+
+# _bootstrap идёт раньше остальных импортов намеренно: он добавляет пакет
+# rail_guard в sys.path и, если на хосте нет numpy/scipy, перезапускает
+# скрипт в контейнере с ROS. После `import numpy` было бы уже поздно.
+import _bootstrap  # noqa: E402
 import argparse
 import os
 
@@ -13,7 +18,6 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 
-import _bootstrap  # noqa: F401
 from rail_guard.lib.config import PipelineConfig, load_yaml
 from rail_guard.lib.dataset import Osdar23Sequence
 from rail_guard.lib.injection import box_target, inject, person_target

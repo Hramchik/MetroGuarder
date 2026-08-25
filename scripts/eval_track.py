@@ -4,12 +4,16 @@
 Алгоритм ищет ось только по облаку точек; poly3d-разметка рельсов из
 датасета используется исключительно как эталон для замера ошибки.
 """
+
+# _bootstrap идёт раньше остальных импортов намеренно: он добавляет пакет
+# rail_guard в sys.path и, если на хосте нет numpy/scipy, перезапускает
+# скрипт в контейнере с ROS. После `import numpy` было бы уже поздно.
+import _bootstrap  # noqa: E402
 import argparse
 import os
 
 import numpy as np
 
-import _bootstrap  # noqa: F401
 from rail_guard.lib.config import PipelineConfig, load_yaml
 from rail_guard.lib.dataset import Osdar23Sequence
 from rail_guard.lib.pipeline import Pipeline
