@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>rail_guard_bringup</name>
+  <version>0.1.0</version>
+  <description>Запуск и настройки комплекса мониторинга габарита</description>
+  <maintainer email="sanek.falaleev@gmail.com">hram</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rail_guard</exec_depend>
+  <exec_depend>rail_guard_msgs</exec_depend>
+  <exec_depend>rviz2</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

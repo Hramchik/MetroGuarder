@@ -1,0 +1,92 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded: ~
+    Tree Height: 700
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 10
+      Plane Cell Count: 40
+      Color: 60; 60; 60
+      Reference Frame: base_link
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Облако лидара
+      Enabled: true
+      Topic:
+        Value: /lidar/points
+        Depth: 2
+        Reliability Policy: Best Effort
+      Style: Points
+      Size (Pixels): 2
+      Color Transformer: AxisColor
+      Axis: Z
+      Decay Time: 0
+    - Class: rviz_default_plugins/PointCloud2
+      Name: После фильтрации
+      Enabled: false
+      Topic:
+        Value: /rail_guard/points_filtered
+        Depth: 2
+        Reliability Policy: Best Effort
+      Style: Points
+      Size (Pixels): 2
+      Color Transformer: FlatColor
+      Color: 120; 160; 255
+    - Class: rviz_default_plugins/PointCloud2
+      Name: Точки в габарите
+      Enabled: true
+      Topic:
+        Value: /rail_guard/points_in_gauge
+        Depth: 2
+        Reliability Policy: Best Effort
+      Style: Spheres
+      Size (m): 0.25
+      Color Transformer: FlatColor
+      Color: 255; 90; 60
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Габарит и препятствия
+      Enabled: true
+      Topic:
+        Value: /rail_guard/markers
+        Depth: 5
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Эталонная разметка
+      Enabled: false
+      Topic:
+        Value: /rail_guard/ground_truth
+        Depth: 1
+        Durability Policy: Transient Local
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: false
+  Global Options:
+    Background Color: 25; 25; 30
+    Fixed Frame: base_link
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Current View
+      Distance: 90
+      Focal Point:
+        X: 45
+        Y: 0
+        Z: 0
+      Pitch: 0.55
+      Yaw: 3.14
+      Target Frame: base_link
+    Saved: ~
+Window Geometry:
+  Height: 1000
+  Width: 1700
+  Displays:
+    collapsed: false

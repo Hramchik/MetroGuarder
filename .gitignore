@@ -1,0 +1,13 @@
+# Данные датасета — качаются скриптом, в репозиторий не кладутся
+data/osdar23/*.zip
+data/osdar23/sequences/
+**/.npy_cache/
+
+# Сборка ROS 2
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
