@@ -84,7 +84,10 @@ def estimate_ground(xyz: np.ndarray, cfg: GroundConfig,
                            valid=valid, rail_offset=cfg.rail_head_offset, y_ref=y_ref_bins)
 
     lateral_all = xyz[:, 1] - np.interp(xyz[:, 0], centers, y_ref_bins)
-    in_band = np.abs(lateral_all) < cfg.search_half_width
+    # Полоса поиска обычно выведена из междупутья (lib/derive.py); без вывода
+    # берётся ширина, заведомо укладывающаяся в пределы своего пути.
+    search_half_width = cfg.search_half_width if cfg.search_half_width is not None else 2.5
+    in_band = np.abs(lateral_all) < search_half_width
     bin_idx = np.digitize(xyz[:, 0], edges) - 1
     order = np.argsort(np.where(in_band, bin_idx, n_bins + 1), kind="stable")
     sorted_bins = np.where(in_band, bin_idx, n_bins + 1)[order]

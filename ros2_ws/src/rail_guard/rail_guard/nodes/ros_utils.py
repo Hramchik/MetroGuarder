@@ -16,19 +16,112 @@ from std_msgs.msg import ColorRGBA, Header
 from visualization_msgs.msg import Marker, MarkerArray
 
 
-def pointcloud2_to_xyzi(msg: PointCloud2) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+_FIELD_DTYPES = {
+    PointField.INT8: np.int8, PointField.UINT8: np.uint8,
+    PointField.INT16: np.int16, PointField.UINT16: np.uint16,
+    PointField.INT32: np.int32, PointField.UINT32: np.uint32,
+    PointField.FLOAT32: np.float32, PointField.FLOAT64: np.float64,
+}
+
+
+def _fast_xyzi(msg: PointCloud2, max_points: int = 0, forward=None,
+               near_limit: float = 40.0, want_intensity: bool = True
+               ) -> Optional[Tuple[np.ndarray, Optional[np.ndarray]]]:
+    """Быстрый путь: x, y, z лежат в буфере подряд как три float32.
+
+    Так устроены облака всех лидаров, которые встречались в записях (x, y, z
+    со смещениями 0, 4, 8), и тогда координаты берутся одним непрерывным
+    срезом: одна копия на кадр вместо трёх выборок по полям с шагом
+    point_step плюс склейка. На 128-луче (920 тыс. точек) это 12 мс вместо
+    35 — разница между «успеваем за период лидара» и «пропускаем каждый
+    третий кадр». Если раскладка другая, возвращаем None и работает общий путь.
+    """
+    by_name = {field.name: field for field in msg.fields}
+    try:
+        xf, yf, zf = by_name["x"], by_name["y"], by_name["z"]
+    except KeyError:
+        return None
+    float32 = PointField.FLOAT32
+    if not (xf.datatype == yf.datatype == zf.datatype == float32
+            and xf.count == yf.count == zf.count == 1
+            and (xf.offset, yf.offset, zf.offset) == (0, 4, 8)):
+        return None
+    step_bytes = int(msg.point_step)
+    if step_bytes < 12:
+        return None
+    raw = np.frombuffer(memoryview(msg.data), dtype=np.uint8)
+    n = raw.size // step_bytes
+    raw = raw[:n * step_bytes].reshape(n, step_bytes)
+    # Прореживать можно только ближнее поле. Дальние точки — это и есть
+    # дальность обнаружения: на 100 м от человека приходит полсотни отражений,
+    # и равномерный шаг по индексу оставил бы от них треть. Продольную ось
+    # подсказывает вызывающий (он знает ориентацию датчика); без подсказки
+    # остаётся равномерный шаг.
+    #
+    # Сначала решаем, какие точки берём, и только потом собираем координаты:
+    # выборка из буфера идёт с шагом point_step, поэтому копировать всё облако
+    # ради четверти точек — самая дорогая ошибка в этом месте. Для решения
+    # достаточно одного столбца (дальности), это втрое меньше байт.
+    keep = None
+    if max_points > 0 and n > max_points:
+        if forward is not None and 0 <= int(forward[0]) < 3:
+            column, sign = forward
+            start = 4 * int(column)
+            along = np.ascontiguousarray(raw[:, start:start + 4]).view(np.float32).ravel()
+            keep = (sign * along) >= near_limit
+            far_count = int(keep.sum())
+            budget = max(max_points - far_count, max_points // 4)
+            near_step = max(1, int(np.ceil((n - far_count) / max(budget, 1))))
+            keep[::near_step] = True
+        else:
+            keep = np.zeros(n, dtype=bool)
+            keep[::int(np.ceil(n / max_points))] = True
+
+    coords = raw[:, :12] if keep is None else raw[:, :12][keep]
+    xyz = np.ascontiguousarray(coords).view(np.float32).reshape(-1, 3)
+    n = xyz.shape[0]
+
+    intensity = None
+    if want_intensity:
+        for key in ("intensity", "i", "reflectivity"):
+            field = by_name.get(key)
+            if field is None or field.count != 1:
+                continue
+            width = _FIELD_DTYPES.get(field.datatype)
+            if width is None or field.offset + np.dtype(width).itemsize > step_bytes:
+                break
+            column = raw[:, field.offset:field.offset + np.dtype(width).itemsize]
+            intensity = np.ascontiguousarray(column).view(width).reshape(n).astype(np.float32)
+            if keep is not None:
+                intensity = intensity[keep]
+            break
+
+    # Невозвраты приходят как NaN; достаточно проверить одну координату —
+    # лидар не выдаёт кадров, где NaN стоит лишь в части осей точки.
+    finite = np.isfinite(xyz[:, 0])
+    del keep
+    if not finite.all():
+        xyz = xyz[finite]
+        intensity = None if intensity is None else intensity[finite]
+    return xyz, intensity
+
+
+def pointcloud2_to_xyzi(msg: PointCloud2, max_points: int = 0, forward=None,
+                        near_limit: float = 40.0, want_intensity: bool = True
+                        ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     """PointCloud2 → (xyz float32 (N,3), intensity float32 (N,) или None).
 
     Читаем сырой буфер напрямую: sensor_msgs_py.point_cloud2.read_points
     на 150 тысячах точек уходит в десятки миллисекунд на копиях.
+
+    `max_points` — потолок на число точек (0 — без ограничения). Прореживание
+    здесь дешевле, чем в пайплайне: копируется сразу столько, сколько нужно.
     """
+    fast = _fast_xyzi(msg, max_points, forward, near_limit, want_intensity)
+    if fast is not None:
+        return fast
     names = [f.name for f in msg.fields]
-    dtype_map = {
-        PointField.INT8: np.int8, PointField.UINT8: np.uint8,
-        PointField.INT16: np.int16, PointField.UINT16: np.uint16,
-        PointField.INT32: np.int32, PointField.UINT32: np.uint32,
-        PointField.FLOAT32: np.float32, PointField.FLOAT64: np.float64,
-    }
+    dtype_map = _FIELD_DTYPES
     fields = []
     offset = 0
     for field in sorted(msg.fields, key=lambda f: f.offset):

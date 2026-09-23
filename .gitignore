@@ -3,6 +3,12 @@ data/osdar23/*.zip
 data/osdar23/sequences/
 **/.npy_cache/
 
+# Записи проездов метро (22 ГБ) и материалы задания: выдаются организаторами,
+# монтируются в контейнер томом и в репозитории им не место.
+dataset/
+*.zst
+*.pdf
+
 # Сборка ROS 2
 ros2_ws/build/
 ros2_ws/install/
@@ -11,3 +17,5 @@ ros2_ws/log/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+/data
+/dataset

@@ -8,7 +8,7 @@
 """
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from typing import Deque, List, Optional, Tuple
 
@@ -29,10 +29,27 @@ class ObjectTrack:
     history: Deque[Tuple[float, float]] = field(default_factory=deque)   # (t, distance)
     recent_hits: Deque[bool] = field(default_factory=deque)
     confidence: float = 0.0
+    # Голоса за класс объекта по всем кадрам трека. Классификация одного кадра
+    # на дальности неустойчива — у объекта то видна полная высота, то половина,
+    # и «крупный» превращается в «человека» и обратно. Наружу отдаётся класс,
+    # за который набралось больше кадров.
+    class_votes: Counter = field(default_factory=Counter)
 
     @property
     def confirmed(self) -> bool:
         return self.hits >= 1 and self.confidence > 0.0
+
+    @property
+    def classification(self) -> int:
+        """Класс по всему треку: то, за что набралось больше кадров."""
+        if not self.class_votes:
+            return self.detection.classification
+        return int(self.class_votes.most_common(1)[0][0])
+
+    @property
+    def class_name(self) -> str:
+        from .detect import CLASS_NAMES
+        return CLASS_NAMES.get(self.classification, "unknown")
 
     def closing_speed(self) -> float:
         """МНК по истории дальности: >0 — объект приближается."""
@@ -81,7 +98,8 @@ class ObjectTracker:
             cost = np.linalg.norm(pred_pos[:, None, :] - det_pos[None, :, :], axis=2)
             # Ворота ассоциации расширяются с дальностью: на 150 м центроид
             # кластера гуляет на метры просто из-за смены видимых граней.
-            gate = self.cfg.max_assoc_distance + 0.02 * np.array([d.distance for d in detections])
+            gate = self.cfg.max_assoc_distance \
+                + self.cfg.assoc_per_meter * np.array([d.distance for d in detections])
             order = np.dstack(np.unravel_index(np.argsort(cost, axis=None), cost.shape))[0]
             for ti, di in order:
                 if ti in used_track or di in used_det:
@@ -98,6 +116,7 @@ class ObjectTracker:
             track = ObjectTrack(id=self._next_id, detection=det, timestamp=timestamp)
             track.history.append((timestamp, det.distance))
             track.recent_hits.append(True)
+            track.class_votes[det.classification] += 1
             self._next_id += 1
             self._update_confidence(track)
             self.tracks.append(track)
@@ -121,6 +140,7 @@ class ObjectTracker:
         track.hits += 1
         track.age += 1
         track.misses = 0
+        track.class_votes[det.classification] += 1
         track.history.append((timestamp, det.distance))
         while len(track.history) > self.cfg.history:
             track.history.popleft()

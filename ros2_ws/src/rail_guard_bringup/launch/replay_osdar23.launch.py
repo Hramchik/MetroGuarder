@@ -16,7 +16,7 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description() -> LaunchDescription:
     share = get_package_share_directory("rail_guard_bringup")
-    default_config = os.path.join(share, "config", "osdar23.yaml")
+    default_config = os.path.join(share, "config", "mainline.yaml")
     default_rviz = os.path.join(share, "rviz", "rail_guard.rviz")
 
     args = [

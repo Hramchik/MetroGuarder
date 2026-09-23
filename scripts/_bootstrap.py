@@ -35,8 +35,19 @@ def _reexec_in_container() -> None:
             "не найден — запустите скрипт в окружении с ROS 2 и научным стеком.")
 
     script = os.path.abspath(sys.argv[0])
-    inner = " ".join(shlex.quote(part) for part in
-                     ["env", "RAIL_GUARD_REEXEC=1", "python3", script, *sys.argv[1:]])
+    command = " ".join(shlex.quote(part) for part in
+                       ["env", "RAIL_GUARD_REEXEC=1", "python3", script, *sys.argv[1:]])
+    # Внутри контейнера ROS 2 надо ещё подключить: `bash -lc` читает профиль
+    # пользователя, а setup.bash в нём обычно не прописан — и скрипт падает на
+    # `import rosbag2_py`, хотя всё установлено. Дистрибутив ищется на месте:
+    # humble, jazzy или какой там окажется. Собранный воркспейс подключается
+    # следом, если он есть, — от него нужны сообщения rail_guard_msgs.
+    workspace = os.path.join(os.path.dirname(PKG_ROOT), "..", "install", "setup.bash")
+    inner = (
+        'for s in /opt/ros/*/setup.bash; do [ -f "$s" ] && . "$s" && break; done; '
+        f'[ -f {shlex.quote(os.path.normpath(workspace))} ] && '
+        f'. {shlex.quote(os.path.normpath(workspace))}; '
+        + command)
     print(f"[rail-guard] numpy на хосте нет — перезапускаю в distrobox «{CONTAINER}»",
           file=sys.stderr)
     raise SystemExit(subprocess.call(["distrobox", "enter", CONTAINER, "--",

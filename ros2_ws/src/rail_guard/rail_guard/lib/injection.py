@@ -6,12 +6,22 @@
 данные дают честную оценку ложных срабатываний, но не дают ни одной
 истинно-положительной цели, а без них нельзя измерить дальность детекции.
 
-Решение — вставлять цель в реальный кадр с физически корректной
-плотностью точек. Модель плотности не выдумана, а измерена по этому же
-датасету: число отражений от объекта площадью A на дальности r равно
-k * A / r^2, где k получено по размеченным людям (см. POINTS_PER_M2_AT_1M).
-Проверка: человек 0.5 x 1.88 м на 78 м — 118 точек в разметке, на 143 м —
-63 точки; обе точки дают k ≈ 7.8e5 с расхождением 5 %.
+Решение — вставлять цель в реальный кадр с физически корректной плотностью
+точек: число отражений от цели фронтальной площади A на дальности r равно
+fill · k · A / r², где k — плотность лучей, а fill — доля лучей, дающих
+полезный возврат.
+
+**Плотность берётся из измерения того самого кадра**, в который вставляется
+цель (`lib/sensor_model.py`), а не из константы. Прежде здесь стояло число,
+снятое с комплекта лидаров OSDaR23, и оно молча делало оценку дальности
+неверной на любом другом датчике: на вдвое более редком лидаре подставленная
+цель получала вдвое больше точек, чем получила бы в действительности, и
+измеренная «дальность обнаружения» оказывалась завышенной.
+
+Проверка модели по разметке OSDaR23: человек 0.5 × 1.88 м даёт 118 точек на
+78 м и 63 на 143 м; измеренная по тем же кадрам плотность лучей переднего
+сектора вместе с fill ≈ 0.5 воспроизводит оба числа. Перемерить fill на
+своих данных можно скриптом `scripts/measure_sensor.py`.
 """
 from __future__ import annotations
 
@@ -20,11 +30,13 @@ from typing import Optional, Tuple
 
 import numpy as np
 
-# Точек на квадратный метр фронтальной площади, приведённое к дальности 1 м.
-# Значение относится к сводному облаку OSDaR23 (Pandar64 + 3 x Livox Tele-15
-# + 2 x Waymo Honeycomb, кадр 100 мс). Для другого лидара его нужно
-# перемерить по своим данным — параметр вынесен в аргумент.
-POINTS_PER_M2_AT_1M = 7.8e5
+from .sensor_model import SensorProfile, measure_beam_density
+
+# Доля лучей, попавших в габаритный прямоугольник цели и давших полезный
+# возврат: силуэт занимает не весь прямоугольник, тёмная поверхность и косой
+# угол падения съедают ещё часть. Значение по умолчанию совпадает с
+# safety.target_fill и проверяется по разметке (scripts/measure_sensor.py).
+DEFAULT_FILL = 0.5
 
 
 @dataclass
@@ -67,9 +79,19 @@ def crop_target(xyz: np.ndarray, intensity: Optional[np.ndarray], center: np.nda
 
 
 def expected_points(target: Target, distance: float,
-                    density: float = POINTS_PER_M2_AT_1M) -> int:
-    """Сколько отражений даст цель на этой дальности."""
-    return int(max(0, round(density * target.frontal_area / max(distance, 1.0) ** 2)))
+                    sensor: Optional[SensorProfile] = None,
+                    fill: float = DEFAULT_FILL) -> int:
+    """Сколько отражений даст цель на этой дальности.
+
+    `sensor` — профиль датчика, измеренный по кадру, в который вставляется
+    цель. Без него функция работать не может: число отражений — свойство
+    конкретного лидара, а не цели.
+    """
+    if sensor is None or not sensor.valid:
+        raise ValueError("нужен измеренный профиль датчика: подставленная цель "
+                         "обязана иметь плотность точек того лидара, в кадр "
+                         "которого её вставляют (см. lib/sensor_model.py)")
+    return int(max(0, round(sensor.expected_points(target.frontal_area, distance, fill))))
 
 
 def _sample_surface(target: Target, count: int, rng: np.random.Generator) -> np.ndarray:
@@ -91,15 +113,22 @@ def _sample_surface(target: Target, count: int, rng: np.random.Generator) -> np.
 
 def inject(xyz: np.ndarray, intensity: Optional[np.ndarray], target: Target,
            position: np.ndarray, rng: Optional[np.random.Generator] = None,
-           density: float = POINTS_PER_M2_AT_1M, range_noise: float = 0.02,
+           sensor: Optional[SensorProfile] = None, fill: float = DEFAULT_FILL,
+           range_noise: float = 0.02,
            occlude: bool = True) -> Tuple[np.ndarray, np.ndarray, int]:
     """Вставляет цель в облако. position — точка опоры (низ цели) в СК лидара.
+
+    `sensor` — измеренный профиль датчика; если не передан, плотность лучей
+    меряется по самому этому кадру. Так подставленная цель всегда получает
+    столько точек, сколько дал бы тот лидар, чей кадр перед нами.
 
     Возвращает (облако, интенсивность, число добавленных точек).
     """
     rng = rng or np.random.default_rng(0)
     distance = float(np.hypot(position[0], position[1]))
-    count = expected_points(target, distance, density)
+    if sensor is None or not sensor.valid:
+        sensor = measure_frame_density(xyz, target, position)
+    count = expected_points(target, distance, sensor, fill)
     if count <= 0:
         return xyz, (intensity if intensity is not None else np.zeros(len(xyz), np.float32)), 0
 
@@ -118,6 +147,27 @@ def inject(xyz: np.ndarray, intensity: Optional[np.ndarray], target: Target,
     new_intensity = np.full(count, target.reflectivity, dtype=np.float32)
     return (np.vstack([xyz, points.astype(np.float32)]),
             np.concatenate([base_intensity, new_intensity]), count)
+
+
+def measure_frame_density(xyz: np.ndarray, target: Target,
+                          position: np.ndarray) -> SensorProfile:
+    """Плотность лучей того кадра, в который вставляется цель.
+
+    Сектор берётся вокруг направления на цель и по её угловому размеру с
+    запасом: плотность лучей неоднородна по полю зрения (у комплекта из
+    нескольких лидаров она различается на порядок), и значение имеет смысл
+    только для того направления, куда цель ставится.
+    """
+    distance = max(float(np.hypot(position[0], position[1])), 1.0)
+    # Не уже нескольких градусов: в совсем узком окне точек не хватит на
+    # устойчивую оценку, а плотность в пределах такого окна уже однородна.
+    az_half = max(np.arctan2(3.0 * float(target.size[1]), distance), np.radians(5.0))
+    el_half = max(np.arctan2(3.0 * float(target.size[2]), distance), np.radians(3.0))
+    measured = measure_beam_density(xyz, az_half, el_half)
+    if measured is None:
+        raise ValueError("не удалось измерить плотность лучей по кадру: "
+                         "в секторе цели слишком мало точек")
+    return measured
 
 
 def _visibility_mask(xyz: np.ndarray, target_points: np.ndarray, target: Target,

@@ -14,7 +14,9 @@
 # скрипт в контейнере с ROS. После `import numpy` было бы уже поздно.
 import _bootstrap  # noqa: E402
 import argparse
+import copy
 import os
+import sys
 from typing import List, Optional
 
 import numpy as np
@@ -22,9 +24,17 @@ import numpy as np
 from rail_guard.lib.config import PipelineConfig, load_yaml
 from rail_guard.lib.dataset import Osdar23Sequence
 from rail_guard.lib.decision import ACTION_NAMES
-from rail_guard.lib.injection import (POINTS_PER_M2_AT_1M, box_target, expected_points,
-                                      inject, person_target)
+from rail_guard.lib.derive import sensor_sector
+from rail_guard.lib.sensor_model import measure_beam_density
+from rail_guard.lib.injection import box_target, inject, person_target
 from rail_guard.lib.pipeline import Pipeline
+
+
+def without_kinematic_gate(cfg: PipelineConfig) -> PipelineConfig:
+    """Копия конфигурации без кинематического гейта (см. run_case)."""
+    relaxed = copy.deepcopy(cfg)
+    relaxed.decision.kinematic_gate = 0.0
+    return relaxed
 
 
 def gt_arc(frame) -> Optional[np.ndarray]:
@@ -38,9 +48,18 @@ def gt_arc(frame) -> Optional[np.ndarray]:
 
 
 def run_case(seq: Osdar23Sequence, cfg: PipelineConfig, target, distance: float,
-             lateral: float, density: float, speed_override=None,
-             route_prior: bool = False) -> dict:
-    """Прогоняет всю последовательность с подставленной целью."""
+             lateral: float, fill: float, speed_override=None,
+             route_prior: bool = False, sensor=None) -> dict:
+    """Прогоняет всю последовательность с подставленной целью.
+
+    Цель стоит на одной и той же дальности во всех кадрах: так замер
+    дальности детекции не смешивается с замером точности сопровождения.
+    Из-за этого приходится отключать кинематический гейт: относительно
+    поезда такая цель «летит» с его же скоростью, а гейт именно это и
+    отсеивает как артефакт коридора. Сам гейт проверяется на реальных
+    записях (docs/EXPERIMENTS.md) и отдельным тестом.
+    """
+    cfg = without_kinematic_gate(cfg)
     pipeline = Pipeline(cfg)
     rng = np.random.default_rng(20260825)
     detected_frames = 0
@@ -68,7 +87,12 @@ def run_case(seq: Osdar23Sequence, cfg: PipelineConfig, target, distance: float,
         elif pipeline._track_model is not None:
             axis_y = float(pipeline._track_model.y_at(distance))
         position = np.array([distance, axis_y + lateral, base_z])
-        xyz, intensity, added = inject(xyz, intensity, target, position, rng, density=density)
+        # Плотность точек цели — из измерения того самого кадра, в который она
+        # вставляется, и в направлении, куда она ставится (lib/sensor_model.py).
+        # Константа здесь означала бы, что дальность меряется не для этого
+        # лидара, а для того, на котором её когда-то сняли.
+        xyz, intensity, added = inject(xyz, intensity, target, position, rng,
+                                       sensor=sensor, fill=fill)
         injected_points.append(added)
 
         if route_prior:
@@ -119,7 +143,8 @@ def main() -> int:
     ap.add_argument("--config", default=None)
     ap.add_argument("--distances", default="20,40,60,80,100,120,140,160,180,200")
     ap.add_argument("--lateral", type=float, default=0.0, help="смещение цели от оси, м")
-    ap.add_argument("--density", type=float, default=POINTS_PER_M2_AT_1M)
+    ap.add_argument("--fill", type=float, default=None,
+                    help="доля лучей цели, дающих возврат (по умолчанию — из профиля)")
     ap.add_argument("--targets", default="person,box40,box20")
     ap.add_argument("--route-prior", action="store_true",
                     help="ось пути берётся из разметки (эмуляция путевой карты метро)")
@@ -143,8 +168,17 @@ def main() -> int:
     print(f"Последовательность: {seq.name}, кадров {len(seq)}")
     print("Ось пути: " + ("из разметки (эмуляция путевой карты)" if args.route_prior
                           else "оценивается по облаку точек"))
-    print(f"Модель плотности: {args.density:.2g} точек на м² приведённо к 1 м "
-          f"(измерена по размеченным людям OSDaR23)")
+    # Плотность лучей меряется по кадрам этой же последовательности: она
+    # свойство комплекта лидаров, и подставленная цель обязана получить
+    # ровно столько точек, сколько дал бы этот комплект.
+    fill = args.fill if args.fill is not None else cfg.safety.target_fill
+    probe = measure_beam_density(seq.load(0)[0], *sensor_sector(cfg))
+    if probe is None:
+        print("Не удалось измерить плотность лучей по первому кадру", file=sys.stderr)
+        return 1
+    print(f"Датчик (измерен по записи): {probe.describe()}")
+    print(f"Доля возвращающих лучей цели: {fill:.2f} — проверяется "
+          f"scripts/measure_sensor.py по разметке")
     if args.speed is not None:
         from rail_guard.lib.decision import braking_distance
         print(f"Скорость поезда задана: {args.speed:.1f} м/с ({args.speed * 3.6:.0f} км/ч), "
@@ -159,7 +193,7 @@ def main() -> int:
         max_detected = 0.0
         max_braking = 0.0
         for distance in distances:
-            res = run_case(seq, cfg, target, distance, args.lateral, args.density,
+            res = run_case(seq, cfg, target, distance, args.lateral, fill,
                            args.speed, args.route_prior)
             rate = res["detected"] / max(res["frames"], 1)
             print(f"{distance:>9.0f}м {res['points']:>7d} {res['detected']:>4d}/{res['frames']:<4d} "

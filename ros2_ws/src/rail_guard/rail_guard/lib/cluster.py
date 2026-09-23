@@ -13,8 +13,18 @@ import numpy as np
 from .config import ClusterConfig
 
 
+# Значения связности, когда конфиг ещё не разрешён (см. lib/derive.py):
+# базовый радиус порядка размера небольшого предмета и расхождение лучей
+# типового сканирующего лидара. Нужны только для прямого вызова этапа вне
+# тракта — сам тракт всегда работает на выведенных значениях.
+_FALLBACK_EPS0 = 0.15
+_FALLBACK_EPS_PER_METER = 0.007
+
+
 def epsilon_for(xyz: np.ndarray, cfg: ClusterConfig) -> np.ndarray:
-    return np.clip(cfg.eps0 + cfg.eps_per_meter * np.abs(xyz[:, 0]), cfg.eps0, cfg.eps_max)
+    eps0 = cfg.eps0 if cfg.eps0 is not None else _FALLBACK_EPS0
+    per_meter = cfg.eps_per_meter if cfg.eps_per_meter is not None else _FALLBACK_EPS_PER_METER
+    return np.clip(eps0 + per_meter * np.abs(xyz[:, 0]), eps0, cfg.eps_max)
 
 
 def cluster(xyz: np.ndarray, cfg: ClusterConfig) -> np.ndarray:
@@ -55,13 +65,44 @@ def cluster(xyz: np.ndarray, cfg: ClusterConfig) -> np.ndarray:
     return remap[components]
 
 
+def voxel_leaf_at(distance: np.ndarray | float,
+                  bands: tuple) -> np.ndarray | float:
+    """Ребро вокселя прореживания на данной дальности."""
+    d = np.asarray(distance, dtype=np.float64)
+    leaf = np.zeros_like(d)
+    lower = 0.0
+    for upper, size in bands:
+        leaf = np.where((d >= lower) & (d < upper), size, leaf)
+        lower = upper
+    return leaf
+
+
 def min_points_for_range(distance: np.ndarray | float, cfg: ClusterConfig) -> np.ndarray | float:
     """Сколько точек считать достаточным на данной дальности.
 
-    Число возвратов от объекта падает как 1/r^2 — требовать одинаковый
-    порог на 20 и на 150 м значит либо ослепнуть вдали, либо утонуть
-    в ложных срабатываниях вблизи.
+    Две физические границы, и берётся меньшая из них.
+
+    **Лучи.** Число возвратов от объекта падает как 1/r²: требовать одинаковый
+    порог на 20 и на 150 м значит либо ослепнуть вдали, либо утонуть в ложных
+    срабатываниях вблизи.
+
+    **Прореживание.** В ближней зоне облако режется вокселем, и цель площадью
+    A даёт не больше A/L² точек, сколько бы лучей в неё ни попало: на 20 м
+    предмет 40 см при вокселе 12 см — это десяток точек, а не две сотни.
+    Порог, посчитанный только по лучам, в ближней зоне оказывается заведомо
+    недостижимым — и система не видит предмет прямо перед собой.
     """
     d = np.maximum(np.asarray(distance, dtype=np.float64), 1.0)
+    if cfg.ref_min_points is None:
+        # Порог выводится из измеренной плотности лучей (lib/derive.py). Пока
+        # датчик не измерен, требовать больше минимума нельзя: это означало бы
+        # порог, взятый ниоткуда, и пропуск целей на неизвестном лидаре.
+        return np.full_like(d, cfg.abs_min_points) if np.ndim(d) else cfg.abs_min_points
     scaled = cfg.ref_min_points * (cfg.ref_range / d) ** 2
+    if cfg.voxel_bands and cfg.target_area > 0.0:
+        leaf = voxel_leaf_at(d, cfg.voxel_bands)
+        cap = np.where(leaf > 0.0,
+                       cfg.detection_fraction * cfg.target_area / np.maximum(leaf, 1e-6) ** 2,
+                       np.inf)
+        scaled = np.minimum(scaled, cap)
     return np.maximum(np.ceil(scaled), cfg.abs_min_points)

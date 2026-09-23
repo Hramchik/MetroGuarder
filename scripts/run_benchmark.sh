@@ -3,7 +3,7 @@
 #   ./scripts/run_benchmark.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CFG="$ROOT/ros2_ws/src/rail_guard_bringup/config/osdar23.yaml"
+CFG="$ROOT/ros2_ws/src/rail_guard_bringup/config/mainline.yaml"
 OUT="$ROOT/docs/benchmark_output.txt"
 SEQUENCES=(7_approach_underground_station_7.1 9_station_ruebenkamp_9.1 15_construction_vehicle_15.1)
 PY=${PYTHON:-python3}

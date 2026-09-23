@@ -21,6 +21,7 @@ setup(
         "console_scripts": [
             "dataset_player = rail_guard.nodes.dataset_player_node:main",
             "obstacle_detector = rail_guard.nodes.obstacle_detector_node:main",
+            "result_monitor = rail_guard.nodes.result_monitor_node:main",
         ],
     },
 )
