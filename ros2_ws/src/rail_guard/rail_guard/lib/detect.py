@@ -110,6 +110,91 @@ def _is_infrastructure(det: Detection, corridor: Corridor, cfg: ObjectFilterConf
     return None
 
 
+def _segment_percentile(values: np.ndarray, labels: np.ndarray, n_labels: int,
+                        fraction: float, valid: Optional[np.ndarray] = None
+                        ) -> np.ndarray:
+    """Перцентиль внутри каждого кластера — сортировкой по (метка, значение).
+
+    Прямого группового перцентиля в numpy нет, а цикл по кластерам — это как
+    раз та задержка, которую здесь убирают. Сортировка по паре ключей ставит
+    точки каждого кластера подряд и по возрастанию, после чего нужный элемент
+    берётся по смещению от начала сегмента.
+    """
+    out = np.full(n_labels, np.nan)
+    keep = np.ones(values.shape[0], dtype=bool) if valid is None else valid
+    if not keep.any():
+        return out
+    lab = labels[keep]
+    val = values[keep]
+    order = np.lexsort((val, lab))
+    lab_sorted, val_sorted = lab[order], val[order]
+    counts = np.bincount(lab_sorted, minlength=n_labels)
+    starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+    present = counts > 0
+    pos = starts[present] + np.floor(fraction * (counts[present] - 1)).astype(np.int64)
+    out[present] = val_sorted[np.clip(pos, 0, val_sorted.size - 1)]
+    return out
+
+
+def _cluster_stats(xyz: np.ndarray, heights: np.ndarray, lateral: np.ndarray,
+                   clearance: np.ndarray, intrusion: Optional[np.ndarray],
+                   order: np.ndarray, start: np.ndarray, stop: np.ndarray,
+                   n_labels: int) -> dict:
+    """Габариты, центр и сводные величины всех кластеров разом.
+
+    Всё считается сегментными свёртками по массиву, отсортированному по
+    меткам: `reduceat` проходит его один раз, независимо от того, сколько в
+    нём кластеров.
+    """
+    sorted_xyz = xyz[order]
+    sorted_h = heights[order]
+    sorted_clearance = clearance[order]
+    counts = (stop - start).astype(np.float64)
+    nonempty = counts > 0
+    # reduceat не любит пустых сегментов: для них берём любой допустимый
+    # индекс, а результат всё равно отбрасываем по маске.
+    safe_start = np.where(nonempty, start, 0)
+
+    def seg(func, data):
+        result = func.reduceat(data, safe_start, axis=0)
+        return result
+
+    min_point = seg(np.minimum, sorted_xyz)
+    max_point = seg(np.maximum, sorted_xyz)
+    total = seg(np.add, sorted_xyz)
+    centroid = total / np.maximum(counts, 1.0)[:, None]
+    height_min = seg(np.minimum, sorted_h)
+    height_max = seg(np.maximum, sorted_h)
+    clearance_min = seg(np.minimum, sorted_clearance)
+
+    # Точки, не вошедшие ни в один кластер, имеют метку -1 и лежат в начале
+    # отсортированного массива: сегменты кластеров начинаются после них.
+    clustered_from = int(start[0]) if n_labels > 0 else 0
+    in_clusters = order[clustered_from:]
+    labels_flat = np.repeat(np.arange(n_labels), (stop - start))
+    lateral_median = _segment_percentile(lateral[in_clusters], labels_flat,
+                                         n_labels, 0.5)
+
+    if intrusion is None:
+        intrusion_q = np.full(n_labels, np.inf)
+    else:
+        # Верхний квартиль, а не медиана: у предмета, стоящего на полотне,
+        # нижние точки лежат на самой поверхности, и медиана занизила бы заход
+        # внутрь свободного места до нуля. Точки, про которые модель ничего не
+        # знает, в квартиль не берутся вовсе: иначе высокий кластер (стена от
+        # полотна до свода) всегда попадал бы верхней частью в неописанные
+        # слои и становился неотвергаемым.
+        known = np.isfinite(intrusion[in_clusters])
+        intrusion_q = _segment_percentile(intrusion[in_clusters], labels_flat,
+                                          n_labels, 0.75, valid=known)
+        intrusion_q = np.where(np.isfinite(intrusion_q), intrusion_q, np.inf)
+
+    return {"min_point": min_point, "max_point": max_point, "centroid": centroid,
+            "height_min": height_min, "height_max": height_max,
+            "clearance": clearance_min, "lateral": lateral_median,
+            "intrusion": intrusion_q}
+
+
 def mark_linear_infrastructure(detections: List[Detection], max_object_length: float,
                               lateral_tolerance: float = 0.25,
                               height_tolerance: float = 0.15,
@@ -197,42 +282,37 @@ def detections_from_clusters(xyz: np.ndarray, labels: np.ndarray, heights: np.nd
     lateral_all = corridor.lateral(xyz)
     clearance_all = corridor.clearance(xyz)
 
+    # Сводка по кластерам считается разом для всех, а не в цикле по каждому.
+    # Цикл на Python по десяткам кластеров с срезами по индексам стоил больше,
+    # чем вся кластеризация, — а это прямая задержка реакции: время от кадра
+    # до команды торможения складывается из таких мест.
+    stats = _cluster_stats(xyz, heights, lateral_all, clearance_all, intrusion,
+                           order, start, stop, n_labels)
+
     for lab in range(n_labels):
         idx = order[start[lab]:stop[lab]]
         if idx.size == 0:
             continue
-        pts = xyz[idx]
-        h = heights[idx]
-        min_pt = pts.min(axis=0)
-        max_pt = pts.max(axis=0)
+        min_pt, max_pt = stats["min_point"][lab], stats["max_point"][lab]
         # Кластер ближе зоны накопления собран из одного кадра — его точки
         # не масштабируются, сколько бы кадров ни свелось в дальней зоне.
         distance = float(min_pt[0])
         scale = point_scale if distance >= scale_beyond else 1
         det = Detection(
-            centroid=pts.mean(axis=0),
+            centroid=stats["centroid"][lab],
             min_point=min_pt,
             max_point=max_pt,
             size=max_pt - min_pt,
-            distance=float(min_pt[0]),
-            lateral_offset=float(np.median(lateral_all[idx])),
-            height_above_rail=float(h.min()),
-            top_height=float(h.max()),
-            clearance_margin=float(clearance_all[idx].min()),
+            distance=distance,
+            lateral_offset=float(stats["lateral"][lab]),
+            height_above_rail=float(stats["height_min"][lab]),
+            top_height=float(stats["height_max"][lab]),
+            clearance_margin=float(stats["clearance"][lab]),
             point_count=max(1, int(round(idx.size / max(scale, 1)))),
             point_indices=idx,
         )
         if intrusion is not None:
-            # Верхний квартиль, а не медиана: у предмета, стоящего на полотне,
-            # нижние точки лежат на самой поверхности, и медиана занизила бы
-            # заход внутрь свободного места до нуля. Точки, про которые модель
-            # ничего не знает, в квартиль не берутся вовсе: иначе высокий
-            # кластер (стена от полотна до свода) всегда попадал бы верхней
-            # частью в неописанные слои и становился неотвергаемым.
-            known = intrusion[idx]
-            known = known[np.isfinite(known)]
-            det.intrusion_depth = float(np.percentile(known, 75)) if known.size \
-                else float("inf")
+            det.intrusion_depth = float(stats["intrusion"][lab])
 
         length, width, height = (float(det.size[0]), float(det.size[1]), float(det.size[2]))
         reason = ""

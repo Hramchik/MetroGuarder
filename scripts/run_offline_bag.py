@@ -23,10 +23,11 @@ import time
 import numpy as np
 from _bagreader import read_frames
 
+from rail_guard.lib import report
 from rail_guard.lib.config import PipelineConfig, load_yaml, parse_param
 from rail_guard.lib.pipeline import Pipeline
 
-ACTIONS = {0: "свободен", 1: "внимание", 2: "служебное", 3: "ЭКСТРЕННОЕ"}
+ACTIONS = report.ACTION_TEXT
 DEFAULT_CONFIG = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "ros2_ws", "src", "rail_guard_bringup", "config", "metro.yaml")
@@ -74,17 +75,25 @@ def main() -> int:
     cfg.debug = cfg.debug or args.reasons
     pipeline = Pipeline(cfg)
 
-    speed_note = "из облаков" if args.speed is None else f"{args.speed} м/с"
-    print(f"запись: {os.path.basename(args.bag.rstrip('/'))}   "
-          f"профиль: {os.path.basename(args.config)}   скорость: {speed_note}")
+    style = report.Style()
+    speed_note = "оценивается по облакам" if args.speed is None else f"{args.speed} м/с (задана)"
+    print(report.panel("rail-guard · офлайн-прогон", [
+        f"запись:   {os.path.basename(args.bag.rstrip('/'))}",
+        f"профиль:  {os.path.basename(args.config)} · "
+        f"габарит {2 * cfg.gauge.half_width:.2f} × {cfg.gauge.height:.2f} м · "
+        f"колея {cfg.track.gauge:.3f} м",
+        f"скорость: {speed_note}",
+        f"счёт:     {pipeline.backend_note}",
+    ], style))
     if not args.quiet:
-        print(f"{'кадр':>5} {'точек':>8} {'после':>7} {'ось,м':>6} {'R,м':>7} {'кор,м':>6} "
-              f"{'помех':>6} {'ближ,м':>7} {'v,м/с':>6} {'источник':>9} "
-              f"{'решение':<10} {'мс':>6}")
+        print(report.frame_header(style))
+        print(style.rule())
 
     actions = {0: 0, 1: 0, 2: 0, 3: 0}
     latency, fit_range, reach, nearest, speeds = [], [], [], [], []
     sources, reasons, stages = {}, {}, {}
+    stamps, limits, decision_latency, scenes = [], [], [], {}
+    beam_density = 0.0
     rails = degenerate = detections = frames_with_objects = 0
 
     for index, (xyz, intensity, stamp) in enumerate(read_frames(args.bag, args.topic)):
@@ -108,6 +117,14 @@ def main() -> int:
             nearest.append(float(result.decision.nearest_distance))
         for key, value in result.timings.items():
             stages.setdefault(key, []).append(value)
+        stamps.append(float(stamp))
+        decision_latency.append(float(result.latency))
+        if result.detection_limit > 0.0:
+            limits.append(float(result.detection_limit))
+        if result.sensor_profile is not None and result.sensor_profile.valid:
+            beam_density = float(result.sensor_profile.points_per_sr)
+        if result.scene is not None:
+            scenes[result.scene.kind] = scenes.get(result.scene.kind, 0) + 1
         if cfg.debug:
             for det in result.detections:
                 key = det.reject_reason or "принят"
@@ -115,53 +132,93 @@ def main() -> int:
         if result.frame_decided:
             print(f"      СК датчика: {result.frame_spec} — {result.frame_source}")
         if not args.quiet:
-            radius = result.track.curvature_radius
-            # Значения готовим заранее: перенос строки внутри фигурных скобок
-            # f-строки до Python 3.12 — синтаксическая ошибка, а в контейнере 3.10.
-            radius_text = abs(radius) if np.isfinite(radius) else 0.0
-            near = result.decision.nearest_distance
-            near_text = near if np.isfinite(near) else 0.0
-            speed_text = result.ego_speed if result.ego_speed is not None else 0.0
-            print(f"{index:5d} {result.input_points:8d} {result.filtered_points:7d} "
-                  f"{result.track.fit_range:6.0f} {radius_text:7.0f} "
-                  f"{result.corridor.reach:6.0f} {len(result.obstacles):6d} "
-                  f"{near_text:7.1f} {speed_text:6.1f} "
-                  f"{result.speed_source:>9} {ACTIONS[int(result.decision.action)]:<10} "
-                  f"{latency[-1]:6.1f}")
+            print(report.frame_line(
+                index=index, points=result.input_points,
+                confirmed_range=result.track.fit_range,
+                corridor=result.corridor.reach,
+                obstacles=len(result.obstacles),
+                nearest=result.decision.nearest_distance,
+                speed=result.ego_speed,
+                latency_ms=latency[-1], action=int(result.decision.action),
+                style=style))
 
     total = sum(actions.values())
     if not total:
         print("Кадров не прочитано: проверьте путь к записи и имя топика")
         return 1
 
-    print(f"\nкадров: {total}")
-    print("решения: " + ", ".join(f"{ACTIONS[key]}={value} ({100 * value / total:.0f} %)"
-                                  for key, value in actions.items() if value))
+    width = report.terminal_width()
+    span = 0.0
+    if stamps:
+        span = max(stamps) - min(stamps)
     lat = np.array(latency)
-    print(f"время кадра, мс: медиана {np.median(lat):.1f}  p95 {np.percentile(lat, 95):.1f}  "
-          f"максимум {lat.max():.1f}; дольше 100 мс — {int((lat > 100).sum())} кадров "
-          f"({100 * (lat > 100).mean():.0f} %)")
-    print(f"ось по рельсам: {rails}/{total} кадров, подтверждена до "
-          f"{np.median(fit_range):.0f} м (медиана), максимум {max(fit_range):.0f} м")
-    print(f"длина коридора, м: медиана {np.median(reach):.0f}, максимум {max(reach):.0f}")
-    print(f"детекций: {detections} в {frames_with_objects} кадрах"
-          + (f"; ближайшая помеха медиана {np.median(nearest):.1f} м" if nearest else ""))
+    print()
+    print(style("═" * width, "cyan"))
+    print(style(f"  ИТОГ ПРОГОНА · {total} кадров · {report.duration(span)} записи", "bold"))
+    print(style("═" * width, "cyan"))
+
+    print(style("\n Решения", "bold"))
+    for line in report.decisions_block(actions, total, style):
+        print(line)
+
+    print(style("\n Реакция", "bold"))
+    period = 1e3 * float(np.median(np.diff(np.sort(stamps)))) if len(stamps) > 2 else 100.0
+    late = int((lat > period).sum())
+    verdict = "укладывается в период лидара" if np.median(lat) <= period \
+        else style("медленнее периода лидара", "orange")
+    print(f"  счёт кадра                     {np.median(lat):>6.0f} мс "
+          f"(p95 {np.percentile(lat, 95):.0f}, максимум {lat.max():.0f}) — {verdict}")
+    print(f"  кадров дольше периода          {late:>6} из {total} "
+          f"({100.0 * late / total:.0f} %), период {period:.0f} мс")
+    if decision_latency:
+        print(f"  задержка «съёмка → команда»    {1e3 * np.median(decision_latency):>6.0f} мс "
+              f"— входит в тормозной путь")
+    print(f"  вычисления                     {pipeline.backend_note}")
+    if pipeline.gpu_fallback:
+        print("  " + style(f"видеокарта отключилась: {pipeline.gpu_fallback}", "orange"))
+
+    print(style("\n Обзор", "bold"))
+    print(f"  ось по рельсам                 {rails:>6} из {total} кадров, "
+          f"подтверждена до {np.median(fit_range):.0f} м (максимум {max(fit_range):.0f})")
+    print(f"  длина коридора                 {np.median(reach):>6.0f} м "
+          f"(максимум {max(reach):.0f})")
+    if limits:
+        print(f"  предел обнаружения цели        {np.median(limits):>6.0f} м "
+              f"(плотность лучей {beam_density:.2g} точек/ср, измерена по кадрам)")
+    if scenes:
+        names = {"tunnel": "замкнутое сечение", "open": "открытый участок",
+                 "unknown": "не определена"}
+        parts = ", ".join(f"{names.get(k, k)} {100.0 * v / total:.0f} %"
+                          for k, v in sorted(scenes.items(), key=lambda kv: -kv[1]))
+        print(f"  сцена по кадрам                {parts}")
     if speeds:
-        print(f"скорость носителя: медиана {np.median(speeds):.1f} м/с, "
-              f"максимум {max(speeds):.1f} м/с; источник: "
-              + ", ".join(f"{key}={value}" for key, value in sources.items()))
+        src = ", ".join(f"{key}={value}" for key, value in sources.items())
+        print(f"  скорость носителя              {np.median(speeds):>6.1f} м/с "
+              f"(максимум {max(speeds):.1f}); источник: {src}")
+
+    print(style("\n Найденное", "bold"))
+    print(f"  детекций                       {detections:>6} в {frames_with_objects} кадрах"
+          + (f", ближайшая {np.median(nearest):.0f} м (медиана)" if nearest else ""))
     if degenerate:
-        print(f"ВЫРОЖДЕННЫХ КАДРОВ: {degenerate} — облако почти целиком уходит в фильтр")
+        print("  " + style(f"вырожденных кадров: {degenerate} — облако уходит в фильтр "
+                           f"почти целиком", "red"))
+
     if args.stages:
-        print("время по стадиям, мс (медиана):")
-        for key, values in sorted(stages.items(), key=lambda kv: -float(np.median(kv[1]))):
-            if key != "total_ms":
-                print(f"   {key:<18} {np.median(values):6.1f}")
+        print(style("\n Время по стадиям, мс (медиана)", "bold"))
+        ordered = sorted(((k, float(np.median(v))) for k, v in stages.items()
+                          if k != "total_ms"), key=lambda kv: -kv[1])
+        worst = ordered[0][1] if ordered else 1.0
+        for key, value in ordered:
+            print(f"  {key:<18} {value:>6.1f}  {report.bar(value / max(worst, 1e-6), 20, style)}")
     if reasons:
         clusters = sum(reasons.values())
-        print("кластеры в коридоре по причинам отсева:")
+        print(style("\n Кластеры в коридоре по причинам отсева", "bold"))
         for key, value in sorted(reasons.items(), key=lambda kv: -kv[1]):
-            print(f"   {key:<16} {value:6d} ({100 * value / clusters:4.1f} %)")
+            share = value / clusters
+            colour = "green" if key == "принят" else "grey"
+            print(f"  {style(f'{key:<18}', colour)} {value:>6} "
+                  f"{report.bar(share, 16, style)} {100 * share:>4.1f} %")
+    print(style("═" * width, "cyan"))
     return 0
 
 

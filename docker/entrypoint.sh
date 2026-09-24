@@ -21,6 +21,42 @@ source /ws/install/setup.bash
 
 CONFIG="${RAIL_GUARD_CONFIG:-/ws/install/rail_guard_bringup/share/rail_guard_bringup/config/metro.yaml}"
 
+# Где считать: auto (видеокарта, если есть), cpu или gpu. Проверяем сразу и
+# говорим вслух — иначе на стенде непонятно, почему кадр считается медленно:
+# то ли образ собран без cupy, то ли устройство не проброшено в контейнер.
+DEVICE="${RAIL_GUARD_DEVICE:-auto}"
+describe_device() {
+    python3 - "$DEVICE" <<'PYEOF'
+import sys
+choice = (sys.argv[1] or "auto").lower()
+if choice == "cpu":
+    print("вычисления: процессор (выбрано параметром device:=cpu)")
+    raise SystemExit
+import importlib.util
+installed = importlib.util.find_spec("cupy") is not None
+try:
+    import cupy
+except Exception as exc:
+    if installed:
+        # Пакет в образе есть, но библиотеки драйвера нет: контейнер запущен
+        # без проброса устройства.
+        print(f"вычисления: процессор — устройство не проброшено ({type(exc).__name__}); "
+              "добавьте --gpus all к docker run")
+    else:
+        print("вычисления: процессор — образ собран без поддержки видеокарты; "
+              "пересоберите с --build-arg WITH_GPU=true")
+    raise SystemExit
+try:
+    cupy.arange(4).sum()
+    props = cupy.cuda.runtime.getDeviceProperties(cupy.cuda.runtime.getDevice())
+    name = props["name"]
+    print("вычисления: видеокарта " + (name.decode() if isinstance(name, bytes) else str(name)))
+except Exception as exc:
+    print(f"вычисления: процессор — устройство недоступно ({type(exc).__name__}); "
+          "запустите контейнер с --gpus all")
+PYEOF
+}
+
 # Собственный домен DDS, чтобы контейнер не подхватывал чужой трафик; при
 # проигрывании записи с хоста домен должен совпадать (ROS_DOMAIN_ID).
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-0}"
@@ -83,17 +119,19 @@ case "${1:-demo}" in
         fi
         echo "Запись: $BAG"
         echo "Профиль: $CONFIG"
+        describe_device
         exec ros2 launch rail_guard_bringup metro.launch.py \
             config:="$CONFIG" bag:="$BAG" \
             rviz:="${RVIZ:-false}" rate:="${RATE:-1.0}" loop:="${LOOP:-false}" \
-            offset:="${OFFSET:-0.0}" \
+            offset:="${OFFSET:-0.0}" device:="$DEVICE" \
             "${LAUNCH_EXTRA[@]}"
         ;;
     detect)
         echo "Ожидаю облако точек из ROS 2 (домен $ROS_DOMAIN_ID)."
         echo "Профиль: $CONFIG"
+        describe_device
         exec ros2 launch rail_guard_bringup metro.launch.py \
-            config:="$CONFIG" rviz:="${RVIZ:-false}" \
+            config:="$CONFIG" rviz:="${RVIZ:-false}" device:="$DEVICE" \
             "${LAUNCH_EXTRA[@]}"
         ;;
     *)

@@ -19,12 +19,10 @@ from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 
 from rail_guard_msgs.msg import GaugeStatus, ObstacleArray
+from rail_guard.lib import report
 
-ACTION_TEXT = {0: "свободен", 1: "ВНИМАНИЕ", 2: "СЛУЖЕБНОЕ", 3: "ЭКСТРЕННОЕ"}
+ACTION_TEXT = report.ACTION_TEXT
 CLASS_TEXT = {0: "неизв", 1: "человек", 2: "крупный", 3: "мелкий", 4: "инфра"}
-HEADER = (f"{'кадр':>5} {'точек':>8} {'после':>7} {'видит,м':>8} {'путь,м':>7} "
-          f"{'торм,м':>7} {'помех':>6} {'ближайшая помеха':>22} {'скорость, м/с':>15} "
-          f"{'решение':<11} {'мс':>6}")
 
 
 class ResultMonitor(Node):
@@ -53,12 +51,16 @@ class ResultMonitor(Node):
         self.detection_limits: List[float] = []
         self.beam_density = 0.0
         self.scenes: dict = {}
+        self.style = report.Style()
+        self.latencies: List[float] = []      # полная задержка «съёмка → команда»
+        self.backend = ""
+        self._started_panel = False
         # Период кадров считаем по штампам: «уложились в реальное время» —
         # это про период того лидара, который прислал данные, а не про 10 Гц.
         self.stamps: List[float] = []
         if not self.quiet:
-            print(HEADER, flush=True)
-            print("-" * len(HEADER), flush=True)
+            print(report.frame_header(self.style), flush=True)
+            print(self.style.rule(), flush=True)
 
     # Пара сообщений одного кадра публикуется подряд: препятствия, затем
     # решение. Строку печатаем по решению, добрав к нему препятствия.
@@ -83,6 +85,11 @@ class ResultMonitor(Node):
             self.beam_density = float(msg.beam_density)
         if msg.scene:
             self.scenes[msg.scene] = self.scenes.get(msg.scene, 0) + 1
+        if msg.decision_latency > 0.0:
+            self.latencies.append(float(msg.decision_latency) * 1e3)
+        if msg.compute_backend:
+            self.backend = msg.compute_backend
+        self._print_start_panel(msg)
         self.stamps.append(msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9)
         if not msg.clear and msg.nearest_distance < 1e6:
             self.alarm_distances.append(float(msg.nearest_distance))
@@ -102,62 +109,107 @@ class ResultMonitor(Node):
                 nearest = (f"#{closest.id} {CLASS_TEXT.get(int(closest.classification), '?')}"
                            f" {closest.distance:.0f} м")
         if not self.quiet:
-            # При превышении допустимой по дальности обзора скорости показываем
-            # её рядом с измеренной: «14.7 ≤11» читается сразу.
-            speed = (f"{msg.ego_speed:4.1f} ≤{msg.max_safe_speed:<4.0f}" if msg.speed_limited
-                     else f"{msg.ego_speed:4.1f} {msg.speed_source[:9]}")
-            print(f"{self.frames:5d} {points:8d} {after:7d} {msg.detection_range:8.0f} "
-                  f"{msg.confident_range:7.0f} {msg.braking_distance:7.0f} "
-                  f"{msg.obstacle_count:6d} {nearest:>22} "
-                  f"{speed:>15} {ACTION_TEXT.get(int(msg.action), '?'):<11} {latency:6.1f}",
-                  flush=True)
+            shown_latency = float(msg.decision_latency) * 1e3 if msg.decision_latency > 0.0 \
+                else latency
+            line = report.frame_line(
+                index=self.frames, points=points,
+                confirmed_range=float(msg.confident_range),
+                corridor=float(msg.detection_range),
+                obstacles=int(msg.obstacle_count),
+                nearest=float(msg.nearest_distance),
+                speed=float(msg.ego_speed) if msg.speed_source != "default" else None,
+                latency_ms=shown_latency, action=int(msg.action), style=self.style)
+            # Причина решения и превышение скорости дописываются к строке: они
+            # нужны ровно в тех кадрах, где что-то происходит.
+            notes = []
+            if msg.speed_limited:
+                notes.append(self.style(f"быстрее допустимых {msg.max_safe_speed:.0f} м/с",
+                                        "orange"))
+            if nearest != "—":
+                notes.append(self.style(nearest, "grey"))
+            print(line + ("   " + " · ".join(notes) if notes else ""), flush=True)
+
+    def _print_start_panel(self, msg: GaugeStatus) -> None:
+        """Шапка с тем, что система измерила о себе, — печатается один раз.
+
+        Оператору важно знать это до того, как побегут кадры: на каком
+        железе считается, что за датчик и докуда он вообще видит.
+        """
+        if self._started_panel or self.quiet:
+            return
+        self._started_panel = True
+        density = f"{msg.beam_density:.2g} точек/ср" if msg.beam_density > 0 else "не измерена"
+        limit = f"{msg.detection_limit:.0f} м" if msg.detection_limit > 0 else "не определён"
+        scene = {"tunnel": "замкнутое сечение", "open": "открытый участок"}.get(
+            msg.scene, "определяется")
+        print(report.panel("rail-guard · мониторинг габарита", [
+            f"вычисления: {msg.compute_backend or 'процессор'}",
+            f"датчик: плотность лучей {density} · предел обнаружения {limit}",
+            f"сцена: {scene}",
+        ], self.style), flush=True)
+        print(report.frame_header(self.style), flush=True)
+        print(self.style.rule(), flush=True)
 
     # ------------------------------------------------------------------ сводка
     def summary(self) -> None:
+        """Итог по всей записи — то, ради чего прогон и делался."""
         if not self.frames:
             print("Кадров не получено: детектор не публиковал решений.", file=sys.stderr)
             return
         import statistics as st
-        print("\n" + "=" * 78)
-        print(f"Кадров обработано: {self.frames}")
-        order = [(0, "путь свободен"), (1, "внимание"), (2, "служебное торможение"),
-                 (3, "экстренное торможение")]
-        for key, name in order:
-            count = self.actions.get(key, 0)
-            if count:
-                print(f"  {name:<24} {count:5d} ({100.0 * count / self.frames:4.0f} %)")
+        style = self.style
+        width = report.terminal_width()
+
         # Период лидара: медиана разниц штампов принятых кадров. Кадры, до
         # которых тракт не добрался, увеличивают эту разницу, поэтому берём
         # минимальный правдоподобный интервал — он и есть период съёмки.
         deltas = sorted(b - a for a, b in zip(self.stamps[:-1], self.stamps[1:])
                         if 1e-3 < b - a < 1.0)
         period_ms = 1000.0 * deltas[max(0, int(0.05 * len(deltas)))] if deltas else 100.0
+        span = (self.stamps[-1] - self.stamps[0]) if len(self.stamps) > 1 else 0.0
+
+        print()
+        print(style("═" * width, "cyan"))
+        print(style(f"  ИТОГ ПРОГОНА · {self.frames} кадров · "
+                    f"{report.duration(span)} записи", "bold"))
+        print(style("═" * width, "cyan"))
+
+        print(style("\n Решения", "bold"))
+        for line in report.decisions_block(self.actions, self.frames, style):
+            print(line)
+
+        print(style("\n Реакция", "bold"))
+        if self.latencies:
+            median = st.median(self.latencies)
+            late = sum(1 for v in self.latencies if v > period_ms)
+            verdict = "укладывается в период лидара" if median <= period_ms \
+                else style("медленнее периода лидара", "orange")
+            print(f"  задержка «съёмка → команда»   {median:>6.0f} мс "
+                  f"(p95 {st.quantiles(self.latencies, n=20)[-1]:.0f}) — {verdict}")
+            print(f"  кадров дольше периода          {late:>6} из {len(self.latencies)} "
+                  f"({100.0 * late / len(self.latencies):.0f} %), период {period_ms:.0f} мс")
         if self.latency:
-            over = sum(1 for v in self.latency if v > period_ms)
-            print(f"Задержка обработки, мс: медиана {st.median(self.latency):.1f}, "
-                  f"максимум {max(self.latency):.1f}; дольше периода лидара "
-                  f"({period_ms:.0f} мс) {over} кадров "
-                  f"({100.0 * over / len(self.latency):.0f} %)")
-            print(f"Частота обработки: {1000.0 / max(st.median(self.latency), 1e-3):.1f} кадр/с "
-                  f"по медианной задержке")
+            print(f"  из них счёт тракта             {st.median(self.latency):>6.0f} мс "
+                  f"(максимум {max(self.latency):.0f})")
+        if self.backend:
+            print(f"  вычисления                     {self.backend}")
+
+        print(style("\n Обзор", "bold"))
         if self.ranges:
-            print(f"Дальность мониторинга, м: медиана {st.median(self.ranges):.0f}, "
-                  f"максимум {max(self.ranges):.0f}")
+            print(f"  дальность мониторинга          {st.median(self.ranges):>6.0f} м "
+                  f"(максимум {max(self.ranges):.0f})")
         if self.confident:
-            print(f"Путь подтверждён (рельсы, затем обделка), м: медиана "
-                  f"{st.median(self.confident):.0f}, максимум {max(self.confident):.0f}")
-        if self.safe_speeds:
-            # Главная цифра для оценки «успеет ли поезд остановиться»: с какой
-            # скоростью можно ехать, чтобы тормозной путь укладывался в зону,
-            # где положение пути известно.
-            print(f"Допустимая по обзору скорость, м/с: медиана "
-                  f"{st.median(self.safe_speeds):.1f}; скорость выше допустимой в "
-                  f"{self.speed_limited} кадрах "
-                  f"({100.0 * self.speed_limited / self.frames:.0f} %)")
+            print(f"  путь подтверждён               {st.median(self.confident):>6.0f} м "
+                  f"(максимум {max(self.confident):.0f})")
         if self.detection_limits:
-            print(f"Предел обнаружения минимальной цели, м: медиана "
-                  f"{st.median(self.detection_limits):.0f} "
-                  f"(плотность лучей {self.beam_density:.2g} точек/ср — измерена по кадрам)")
+            print(f"  предел обнаружения цели        {st.median(self.detection_limits):>6.0f} м "
+                  f"(плотность лучей {self.beam_density:.2g} точек/ср, измерена по кадрам)")
+        if self.safe_speeds:
+            share = 100.0 * self.speed_limited / self.frames
+            note = style(f"быстрее допустимого в {share:.0f} % кадров", "orange") \
+                if share > 0 else "скорость всегда в пределах обзора"
+            print(f"  допустимая по обзору скорость  {st.median(self.safe_speeds):>6.1f} м/с "
+                  f"— {note}")
         if self.scenes:
             total = sum(self.scenes.values())
             names = {"tunnel": "замкнутое сечение", "open": "открытый участок",
@@ -165,13 +217,14 @@ class ResultMonitor(Node):
             parts = ", ".join(f"{names.get(kind, kind)} {100.0 * count / total:.0f} %"
                               for kind, count in sorted(self.scenes.items(),
                                                         key=lambda kv: -kv[1]))
-            print(f"Сцена по кадрам: {parts}")
+            print(f"  сцена по кадрам                {parts}")
+
+        print(style("\n Найденное", "bold"))
         if self.alarm_distances:
-            print(f"Дальность обнаружения помехи, м: максимум "
-                  f"{max(self.alarm_distances):.0f}, медиана "
-                  f"{st.median(self.alarm_distances):.0f}")
-        print(f"Уникальных треков за запись: {len(self.track_ids)}")
-        print("=" * 78, flush=True)
+            print(f"  дальность обнаружения помехи   {max(self.alarm_distances):>6.0f} м "
+                  f"(максимум), {st.median(self.alarm_distances):.0f} м (медиана)")
+        print(f"  уникальных объектов за запись  {len(self.track_ids):>6}")
+        print(style("═" * width, "cyan"), flush=True)
 
 
 def main(args=None) -> None:

@@ -22,6 +22,12 @@ import numpy as np
 
 from .config import SensorConfig
 
+def _to_host(array):
+    """Массив в памяти процессора, откуда бы он ни пришёл."""
+    get = getattr(array, "get", None)
+    return get() if callable(get) else array
+
+
 AXIS_NAMES = ("x", "y", "z")
 _AXIS_UNIT = {
     "x": np.array([1.0, 0.0, 0.0]), "-x": np.array([-1.0, 0.0, 0.0]),
@@ -172,6 +178,7 @@ class FrameNormalizer:
         self.source: str = ""
         self.auto_attempts = 0
         self._perm: Optional[np.ndarray] = None
+        self._perm_list: Optional[list] = None
         self._signs: Optional[np.ndarray] = None
         forward, up = _axis_or_none(cfg.forward_axis), _axis_or_none(cfg.up_axis)
         if forward is not None and up is not None:
@@ -189,6 +196,7 @@ class FrameNormalizer:
         self.spec = spec
         self.source = source
         self._perm = np.argmax(np.abs(matrix), axis=0)
+        self._perm_list = [int(v) for v in self._perm]
         self._signs = np.array([matrix[self._perm[j], j] for j in range(3)], dtype=np.float32)
 
     @property
@@ -218,11 +226,16 @@ class FrameNormalizer:
     def is_identity(self) -> bool:
         return self.matrix is not None and bool(np.allclose(self.matrix, IDENTITY))
 
-    def apply(self, xyz: np.ndarray) -> Tuple[np.ndarray, bool]:
-        """Возвращает (облако в рабочей СК, было ли решение принято в этом вызове)."""
+    def apply(self, xyz, xp=np) -> Tuple:
+        """Возвращает (облако в рабочей СК, было ли решение принято в этом вызове).
+
+        `xp` — модуль массивов: облако может лежать и в памяти видеокарты.
+        Само определение ориентации всегда идёт на процессоре — оно делается
+        один раз за запись, по подвыборке, и переносить ради него нечего.
+        """
         decided_now = False
         if self.matrix is None:
-            guess = detect_axes(xyz, self.cfg.auto_min_points)
+            guess = detect_axes(np.asarray(_to_host(xyz)), self.cfg.auto_min_points)
             self.auto_attempts += 1
             if guess is not None and guess.confidence >= self.cfg.auto_min_confidence:
                 self._set_matrix(rotation_from_axes(guess.forward, guess.up), guess.spec,
@@ -238,7 +251,9 @@ class FrameNormalizer:
 
         if self.is_identity:
             return xyz, decided_now
-        rotated = xyz[:, self._perm]
+        # Перестановка задаётся списком, а не массивом numpy: индексация
+        # массива на видеокарте чужим массивом-индексом не везде допустима.
+        rotated = xyz[:, self._perm_list]
         if not np.allclose(self._signs, 1.0):
-            rotated = rotated * self._signs
-        return np.ascontiguousarray(rotated, dtype=np.float32), decided_now
+            rotated = rotated * xp.asarray(self._signs)
+        return xp.ascontiguousarray(rotated, dtype=xp.float32), decided_now

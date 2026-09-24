@@ -40,6 +40,8 @@ from typing import Deque, Optional
 
 import numpy as np
 
+from .backend import to_host
+
 TUNNEL = "tunnel"
 OPEN = "open"
 UNKNOWN = "unknown"
@@ -83,25 +85,25 @@ class SceneModel:
                    if self.has_ceiling else ", без перекрытия"))
 
 
-def _side_quantile(band: np.ndarray, values: np.ndarray, n_bands: int,
-                   quantile: float, min_points: int) -> np.ndarray:
+def _side_quantile(band, values, n_bands: int,
+                   quantile: float, min_points: int, xp=np):
     """Квантиль |смещения| по полосам дальности; NaN там, где точек мало.
 
     Полоса без данных — это отсутствие измерения, а не стена на нулевом
     расстоянии, и сливать эти два случая нельзя.
     """
-    result = np.full(n_bands, np.nan)
+    result = xp.full(n_bands, xp.nan)
     if values.size == 0:
         return result
-    order = np.lexsort((values, band))
+    order = xp.lexsort(xp.stack((values, band)))
     sorted_values = values[order]
-    counts = np.bincount(band[order], minlength=n_bands)
-    starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+    counts = xp.bincount(band[order], minlength=n_bands)
+    starts = xp.concatenate((xp.zeros(1, dtype=counts.dtype), xp.cumsum(counts)[:-1]))
     enough = counts >= min_points
-    if not enough.any():
+    if not bool(enough.any()):
         return result
-    pos = starts[enough] + np.floor(quantile * (counts[enough] - 1)).astype(np.int64)
-    result[enough] = sorted_values[np.clip(pos, 0, sorted_values.size - 1)]
+    pos = starts[enough] + xp.floor(quantile * (counts[enough] - 1)).astype(xp.int64)
+    result[enough] = sorted_values[xp.clip(pos, 0, sorted_values.size - 1)]
     return result
 
 
@@ -144,7 +146,7 @@ def classify_scene(x: np.ndarray, lateral: np.ndarray, height: np.ndarray,
                    min_side_points: int = 12, search_half_width: float = 20.0,
                    quantile: float = 0.9,
                    relevant_half_width: float = 0.0,
-                   corridor_half_width: float = 0.0) -> SceneModel:
+                   corridor_half_width: float = 0.0, xp=np) -> SceneModel:
     """Определяет тип сцены по одному кадру.
 
     `lateral` и `height` — поперечное смещение от оси пути и высота над УГР:
@@ -169,7 +171,7 @@ def classify_scene(x: np.ndarray, lateral: np.ndarray, height: np.ndarray,
     """
     if x.size == 0:
         return SceneModel()
-    reach = float(max_range if max_range > 0.0 else x.max())
+    reach = float(max_range if max_range > 0.0 else to_host(x.max()))
     n_bands = int(np.ceil(reach / band))
     if n_bands < 2:
         return SceneModel()
@@ -179,40 +181,40 @@ def classify_scene(x: np.ndarray, lateral: np.ndarray, height: np.ndarray,
     # так признак переносится на любую линию вместе с профилем.
     wall_low, wall_high = 0.4 * gauge_height, 0.9 * gauge_height
     in_wall = (height > wall_low) & (height < wall_high) \
-        & (np.abs(lateral) < search_half_width) & (x > 0.0) & (x < n_bands * band)
+        & (xp.abs(lateral) < search_half_width) & (x > 0.0) & (x < n_bands * band)
     if int(in_wall.sum()) < 2 * min_side_points:
         return SceneModel(kind=OPEN, bands_measured=n_bands)
 
-    idx = np.floor(x[in_wall] / band).astype(np.int64)
+    idx = xp.floor(x[in_wall] / band).astype(xp.int64)
     lat = lateral[in_wall]
-    left = _side_quantile(idx[lat > 0.0], np.abs(lat[lat > 0.0]), n_bands,
-                          quantile, min_side_points)
-    right = _side_quantile(idx[lat < 0.0], np.abs(lat[lat < 0.0]), n_bands,
-                           quantile, min_side_points)
+    left = _side_quantile(idx[lat > 0.0], xp.abs(lat[lat > 0.0]), n_bands,
+                          quantile, min_side_points, xp)
+    right = _side_quantile(idx[lat < 0.0], xp.abs(lat[lat < 0.0]), n_bands,
+                           quantile, min_side_points, xp)
 
-    both = np.isfinite(left) & np.isfinite(right)
+    both = xp.isfinite(left) & xp.isfinite(right)
     # Для признака замкнутости достаточно границы с одной стороны: в
     # двухпутном тоннеле дальняя стена экранирована составом и на шестидесяти
     # метрах уже не видна, и требовать обе значило бы не признать тоннелем
     # ровно тот случай, ради которого всё и делается. Отличить такую стену от
     # лесополосы позволяет второй признак — свод над путём.
-    either = np.isfinite(left) | np.isfinite(right)
+    either = xp.isfinite(left) | xp.isfinite(right)
     # Полоса «с данными» — не та, где есть хоть что-то, а та, где точек хватает
     # на описание сечения. Дальние полосы, куда дошло по десятку отражений,
     # стену не разрешают, и считать их свидетельством против замкнутости
     # нельзя: иначе круглый тоннель с перекрытием в четырёх метрах над путём
     # оказывается «открытым участком» просто потому, что на ста пятидесяти
     # метрах его стен уже не видно.
-    counts = np.bincount(np.floor(x[(x > 0.0) & (x < n_bands * band)] / band
-                                  ).astype(np.int64), minlength=n_bands)
+    counts = xp.bincount(xp.floor(x[(x > 0.0) & (x < n_bands * band)] / band
+                                  ).astype(xp.int64), minlength=n_bands)
     filled = counts[counts > 0]
-    floor = 0.25 * float(np.median(filled)) if filled.size else 0.0
+    floor = 0.25 * float(to_host(xp.median(filled))) if filled.size else 0.0
     populated = counts >= max(floor, float(min_side_points))
     n_populated = max(int(populated.sum()), 1)
-    support = float((either & populated).sum()) / n_populated
+    support = float(to_host((either & populated).sum())) / n_populated
 
     threshold = enclosure_threshold(max_object_length, band, n_populated)
-    widths = (left + right)[both]
+    widths = to_host((left + right)[both])
     half_width = float(np.median(widths) / 2.0) if widths.size else float("nan")
     spread = float(np.median(np.abs(widths - np.median(widths))) / max(np.median(widths), 1e-3)) \
         if widths.size >= 2 else float("nan")
@@ -223,14 +225,14 @@ def classify_scene(x: np.ndarray, lateral: np.ndarray, height: np.ndarray,
     ceiling = float("nan")
     ceiling_support = 0.0
     if np.isfinite(half_width):
-        above = (height > gauge_height) & (np.abs(lateral) < half_width + 1.0) \
+        above = (height > gauge_height) & (xp.abs(lateral) < half_width + 1.0) \
             & (x > 0.0) & (x < n_bands * band)
         if int(above.sum()) >= min_side_points:
-            over = np.bincount(np.floor(x[above] / band).astype(np.int64),
+            over = xp.bincount(xp.floor(x[above] / band).astype(xp.int64),
                                minlength=n_bands) >= min_side_points
-            ceiling_support = float((over & populated).sum()) / n_populated
+            ceiling_support = float(to_host((over & populated).sum())) / n_populated
             if ceiling_support > 0.0:
-                ceiling = float(np.percentile(height[above], 10))
+                ceiling = float(to_host(xp.percentile(height[above], 10)))
 
     # Замкнутое сечение — это непрерывная боковая граница плюс одно из двух:
     # либо свод над путём, либо сама теснота. Одной границы мало — её даёт и

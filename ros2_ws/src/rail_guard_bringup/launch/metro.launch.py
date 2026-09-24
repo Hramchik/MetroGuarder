@@ -27,6 +27,8 @@ def generate_launch_description() -> LaunchDescription:
     default_rviz = os.path.join(share, "rviz", "rail_guard.rviz")
 
     args = [
+        DeclareLaunchArgument("device", default_value="auto",
+                              description="где считать: auto, cpu или gpu"),
         DeclareLaunchArgument("config", default_value=default_config,
                               description="профиль параметров (YAML)"),
         DeclareLaunchArgument("points", default_value="",
@@ -53,7 +55,10 @@ def generate_launch_description() -> LaunchDescription:
     detector = Node(
         package="rail_guard", executable="obstacle_detector", name="obstacle_detector",
         output="screen",
+        # Аргумент device идёт после файла профиля: выбор устройства —
+        # свойство машины, на которой запускают, а не линии.
         parameters=[LaunchConfiguration("config"),
+                    {"compute.device": LaunchConfiguration("device")},
                     {"config_file": LaunchConfiguration("config"),
                      "points_topic": LaunchConfiguration("points"),
                      "publish_debug_clouds": LaunchConfiguration("debug_clouds"),

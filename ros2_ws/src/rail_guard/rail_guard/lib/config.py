@@ -385,6 +385,21 @@ GEOMETRIC_MIN_POINTS = 8
 
 
 @dataclass
+class ComputeConfig:
+    """Где выполнять поэлементные этапы тракта."""
+
+    # auto — взять видеокарту, если она есть; gpu — потребовать её; cpu —
+    # не трогать устройство вовсе. Отказ видеокарты в любом случае переводит
+    # тракт на процессор и не останавливает работу.
+    device: str = "auto"
+    # Ниже этого размера облака видеокарта не используется: перенос кадра на
+    # устройство и обратно стоит времени, и на маленьком кадре он съедает
+    # весь выигрыш. Порог относится к пропускной способности шины, а не к
+    # содержимому данных.
+    min_points_for_gpu: int = 50_000
+
+
+@dataclass
 class SafetyConfig:
     """Что система обязана обнаружить. Физика задачи, а не настройка алгоритма.
 
@@ -570,6 +585,7 @@ class DecisionConfig:
 @dataclass
 class PipelineConfig:
     sensor: SensorConfig = field(default_factory=SensorConfig)
+    compute: ComputeConfig = field(default_factory=ComputeConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     scene: SceneConfig = field(default_factory=SceneConfig)
     preprocess: PreprocessConfig = field(default_factory=PreprocessConfig)

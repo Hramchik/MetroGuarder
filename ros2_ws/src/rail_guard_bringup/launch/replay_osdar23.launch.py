@@ -21,6 +21,8 @@ def generate_launch_description() -> LaunchDescription:
 
     args = [
         DeclareLaunchArgument("sequence", description="каталог распакованной последовательности"),
+        DeclareLaunchArgument("device", default_value="auto",
+                              description="где считать: auto, cpu или gpu"),
         DeclareLaunchArgument("config", default_value=default_config),
         DeclareLaunchArgument("rate", default_value="10.0"),
         DeclareLaunchArgument("loop", default_value="true"),
@@ -44,7 +46,8 @@ def generate_launch_description() -> LaunchDescription:
     detector = Node(
         package="rail_guard", executable="obstacle_detector", name="obstacle_detector",
         output="screen",
-        parameters=[
+        # Устройство задаётся аргументом запуска: это свойство машины, а не линии.
+        parameters=[{"compute.device": LaunchConfiguration("device")}, 
             LaunchConfiguration("config"),
             {
                 "config_file": LaunchConfiguration("config"),

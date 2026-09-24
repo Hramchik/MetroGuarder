@@ -16,6 +16,8 @@ def generate_launch_description() -> LaunchDescription:
     share = get_package_share_directory("rail_guard_bringup")
     default_config = os.path.join(share, "config", "metro.yaml")
     args = [
+        DeclareLaunchArgument("device", default_value="auto",
+                              description="где считать: auto, cpu или gpu"),
         DeclareLaunchArgument("config", default_value=default_config),
         DeclareLaunchArgument("points", default_value="/lidar/points"),
         DeclareLaunchArgument("speed", default_value="/train/speed"),
@@ -24,7 +26,10 @@ def generate_launch_description() -> LaunchDescription:
     detector = Node(
         package="rail_guard", executable="obstacle_detector", name="obstacle_detector",
         output="screen",
+        # Аргумент device идёт после файла профиля: выбор устройства —
+        # свойство машины, на которой запускают, а не линии.
         parameters=[LaunchConfiguration("config"),
+                    {"compute.device": LaunchConfiguration("device")},
                     {"config_file": LaunchConfiguration("config"),
                      "publish_debug_clouds": LaunchConfiguration("debug_clouds")}],
         remappings=[("lidar/points", LaunchConfiguration("points")),

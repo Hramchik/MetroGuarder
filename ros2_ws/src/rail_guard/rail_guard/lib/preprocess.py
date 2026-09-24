@@ -3,6 +3,12 @@
 
 Порядок этапов выбран из соображений цены: сначала дешёвые булевы маски,
 которые убирают 60-80 % точек, и только потом всё, что требует KD-дерева.
+
+Этап целиком состоит из поэлементных операций, сортировок и гистограмм,
+поэтому он написан один раз и работает на любом бэкенде: модуль массивов
+приходит аргументом `xp` (numpy или cupy, см. `lib/backend.py`). Это первый
+из трёх этапов, вынесенных на видеокарту, и самый выгодный: он единственный
+работает с полным кадром — до девятисот тысяч точек на 128-луче.
 """
 from __future__ import annotations
 
@@ -13,7 +19,7 @@ import numpy as np
 from .config import PreprocessConfig
 
 
-def workspace_mask(xyz: np.ndarray, cfg: PreprocessConfig) -> np.ndarray:
+def workspace_mask(xyz, cfg: PreprocessConfig, xp=np):
     """Точки внутри рабочей зоны и вне габарита собственного поезда.
 
     Границы зоны по дальности и ширине обычно выводятся из дальнобойности
@@ -27,7 +33,7 @@ def workspace_mask(xyz: np.ndarray, cfg: PreprocessConfig) -> np.ndarray:
     y_abs_max = cfg.y_abs_max if cfg.y_abs_max is not None else np.inf
     keep = (
         (x > cfg.x_min) & (x < x_max)
-        & (np.abs(y) < y_abs_max)
+        & (xp.abs(y) < y_abs_max)
         & (z > cfg.z_min) & (z < cfg.z_max)
     )
     ex0, ex1, ey0, ey1, ez0, ez1 = cfg.ego_box
@@ -35,11 +41,10 @@ def workspace_mask(xyz: np.ndarray, cfg: PreprocessConfig) -> np.ndarray:
     return keep & ~ego
 
 
-def intensity_mask(xyz: np.ndarray, intensity: Optional[np.ndarray],
-                   cfg: PreprocessConfig) -> np.ndarray:
+def intensity_mask(xyz, intensity, cfg: PreprocessConfig, xp=np):
     """Слабые дальние возвраты — почти всегда пыль, капли или паразитная засветка."""
     if intensity is None or cfg.min_intensity_far <= 0.0:
-        return np.ones(xyz.shape[0], dtype=bool)
+        return xp.ones(xyz.shape[0], dtype=bool)
     far = xyz[:, 0] > cfg.intensity_far_range
     return ~(far & (intensity < cfg.min_intensity_far))
 
@@ -52,35 +57,38 @@ _MAX_VOXEL_CELLS = 16_000_000
 _MAX_CELLS_PER_POINT = 32
 
 
-def voxel_downsample(xyz: np.ndarray, leaf: float) -> np.ndarray:
+def voxel_downsample(xyz, leaf: float, xp=np):
     """Индексы представителей вокселей (первая точка в вокселе).
 
     Возвращает индексы, а не сами точки: вызывающему коду нужно тем же
     срезом проредить интенсивность и прочие поля.
 
-    Представитель ищется раскладкой по таблице вокселей, а не сортировкой
-    ключей: запись «минимального индекса» в таблицу линейна по числу точек,
-    тогда как np.unique сортирует всё облако. На ближней полосе (160 тыс.
-    точек в кадре 64-луча) это 10 мс вместо 25 при том же результате —
-    четверть бюджета реального времени. Там, где таблица не по размеру
-    (дальняя полоса с мелким вокселем: ячеек на два порядка больше, чем
-    точек), остаётся сортировка.
+    На процессоре представитель ищется раскладкой по таблице вокселей: запись
+    «минимального индекса» в таблицу линейна по числу точек, тогда как
+    np.unique сортирует всё облако. На ближней полосе (160 тыс. точек в кадре
+    64-луча) это 10 мс вместо 25 при том же результате.
+
+    На видеокарте та же раскладка непригодна: при записи в одну ячейку из
+    разных потоков выигрывает произвольный, и представитель вокселя менялся бы
+    от запуска к запуску. Поэтому там всегда сортировка — она даёт ровно тот
+    же ответ, что и процессорная ветка, а результат тракта не должен зависеть
+    от того, где его посчитали.
     """
     n = xyz.shape[0]
     if leaf <= 0.0 or n == 0:
-        return np.arange(n)
+        return xp.arange(n)
     # Решётка привязана к абсолютным координатам, а не к границам облака:
     # иначе её начало смещается от кадра к кадру вместе с крайней точкой, и
     # одна и та же поверхность каждый кадр прореживается по-новому. Для
     # сопровождения треков это чистое дрожание.
     inv = np.float32(1.0 / leaf) if xyz.dtype == np.float32 else 1.0 / leaf
-    kx = np.floor(xyz[:, 0] * inv).astype(np.int32)
-    ky = np.floor(xyz[:, 1] * inv).astype(np.int32)
-    kz = np.floor(xyz[:, 2] * inv).astype(np.int32)
+    kx = xp.floor(xyz[:, 0] * inv).astype(xp.int32)
+    ky = xp.floor(xyz[:, 1] * inv).astype(xp.int32)
+    kz = xp.floor(xyz[:, 2] * inv).astype(xp.int32)
     kx -= kx.min(); ky -= ky.min(); kz -= kz.min()
     ny, nz = int(ky.max()) + 1, int(kz.max()) + 1
     n_cells = (int(kx.max()) + 1) * ny * nz
-    table = 0 < n_cells <= min(_MAX_VOXEL_CELLS, _MAX_CELLS_PER_POINT * n)
+    table = xp is np and 0 < n_cells <= min(_MAX_VOXEL_CELLS, _MAX_CELLS_PER_POINT * n)
     if table:
         flat = (kx * ny + ky) * nz + kz
         first = np.full(n_cells, -1, dtype=np.int32)
@@ -91,30 +99,30 @@ def voxel_downsample(xyz: np.ndarray, leaf: float) -> np.ndarray:
         out = first[first >= 0]
         out.sort()
         return out
-    flat = (kx.astype(np.int64) * ny + ky) * nz + kz
-    _uniq, first = np.unique(flat, return_index=True)
-    return np.sort(first)
+    flat = (kx.astype(xp.int64) * ny + ky) * nz + kz
+    _uniq, first = xp.unique(flat, return_index=True)
+    return xp.sort(first)
 
 
-def banded_downsample(xyz: np.ndarray, cfg: PreprocessConfig) -> np.ndarray:
+def banded_downsample(xyz, cfg: PreprocessConfig, xp=np):
     """Прореживание с шагом, зависящим от дальности.
 
     Ближнее поле избыточно плотное — его режем крупным вокселем; дальнее
     поле (ради которого и нужна дальность детекции) не трогаем вовсе.
     """
     if xyz.shape[0] == 0:
-        return np.arange(0)
+        return xp.arange(0)
     rng = xyz[:, 0]
     result = []
     lower = 0.0
     for upper, leaf in cfg.voxel_bands:
-        band = np.where((rng >= lower) & (rng < upper))[0]
+        band = xp.where((rng >= lower) & (rng < upper))[0]
         if band.size:
-            result.append(band[voxel_downsample(xyz[band], leaf)])
+            result.append(band[voxel_downsample(xyz[band], leaf, xp)])
         lower = upper
     if not result:
-        return np.arange(xyz.shape[0])
-    return np.sort(np.concatenate(result))
+        return xp.arange(xyz.shape[0])
+    return xp.sort(xp.concatenate(result))
 
 
 def radius_outlier_mask(xyz: np.ndarray, radius: float = 0.6,
@@ -126,6 +134,9 @@ def radius_outlier_mask(xyz: np.ndarray, radius: float = 0.6,
     физически расходятся, и фиксированный радиус выкосил бы реальную цель.
     Считается через k-го соседа, а не через подсчёт в шаре — так на порядок
     дешевле и не зависит от плотности.
+
+    Остаётся на процессоре: работает по точкам-кандидатам, а их сотни, и
+    KD-дерево на таком объёме быстрее любого переноса на устройство.
     """
     n = xyz.shape[0]
     if n <= min_neighbors:
@@ -138,11 +149,9 @@ def radius_outlier_mask(xyz: np.ndarray, radius: float = 0.6,
     return kth <= allowed
 
 
-def limit_input(xyz: np.ndarray, intensity: Optional[np.ndarray],
-                cfg: PreprocessConfig,
+def limit_input(xyz, intensity, cfg: PreprocessConfig,
                 axes: Optional[Tuple[np.ndarray, np.ndarray]] = None,
-                max_points: Optional[int] = None
-                ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+                max_points: Optional[int] = None, xp=np) -> Tuple:
     """Прореживание входного облака до потолка по числу точек.
 
     Шаг берётся по индексу, а не по пространству: точки в облаке лидара идут
@@ -161,25 +170,24 @@ def limit_input(xyz: np.ndarray, intensity: Optional[np.ndarray],
         # рабочую СК, её столбец и знак подсказывает нормализатор.
         if axes is not None:
             perm, signs = axes
-            along = xyz[:, perm[0]] * signs[0]
+            along = xyz[:, int(perm[0])] * float(signs[0])
         else:
             along = xyz[:, 0]
         far = along >= cfg.decimate_below
         budget = max(limit - int(far.sum()), limit // 4)
         near_count = n - int(far.sum())
         step = max(1, int(np.ceil(near_count / max(budget, 1))))
-        keep = far
+        keep = far.copy()
         keep[::step] = True
         return xyz[keep], (None if intensity is None else intensity[keep])
     step = int(np.ceil(n / limit))
     return xyz[::step], (None if intensity is None else intensity[::step])
 
 
-def preprocess(xyz: np.ndarray, intensity: Optional[np.ndarray],
-               cfg: PreprocessConfig) -> Tuple[np.ndarray, Optional[np.ndarray], np.ndarray]:
+def preprocess(xyz, intensity, cfg: PreprocessConfig, xp=np) -> Tuple:
     """Полный этап фильтрации. Возвращает (точки, интенсивность, индексы в исходном облаке)."""
-    idx = np.where(workspace_mask(xyz, cfg) & intensity_mask(xyz, intensity, cfg))[0]
+    idx = xp.where(workspace_mask(xyz, cfg, xp) & intensity_mask(xyz, intensity, cfg, xp))[0]
     if idx.size == 0:
         return xyz[:0], (intensity[:0] if intensity is not None else None), idx
-    kept = idx[banded_downsample(xyz[idx], cfg)]
+    kept = idx[banded_downsample(xyz[idx], cfg, xp)]
     return xyz[kept], (intensity[kept] if intensity is not None else None), kept

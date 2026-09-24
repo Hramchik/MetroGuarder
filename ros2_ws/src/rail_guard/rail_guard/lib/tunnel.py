@@ -28,6 +28,7 @@ from typing import Optional
 
 import numpy as np
 
+from .backend import sliding_median, to_host
 from .config import TunnelConfig
 from .scene import support_threshold
 
@@ -79,9 +80,9 @@ class FreeSpace:
         return out
 
 
-def _cell_boundary(values: np.ndarray, cell: np.ndarray, n_cells: int,
+def _cell_boundary(values, cell, n_cells: int,
                    boundary_points: int, min_points: int,
-                   outlier_fraction: float) -> np.ndarray:
+                   outlier_fraction: float, xp=np):
     """Докуда в этой ячейке простирается свободное место.
 
     Берётся край **основной массы** отражений слоя, а не самая дальняя точка.
@@ -103,40 +104,41 @@ def _cell_boundary(values: np.ndarray, cell: np.ndarray, n_cells: int,
     Считается сортировкой со смещениями, без группового цикла: ячеек тысячи,
     а точек — сотни тысяч.
     """
-    result = np.full(n_cells, np.nan, dtype=np.float32)
+    result = xp.full(n_cells, xp.nan, dtype=xp.float32)
     if values.size == 0:
         return result
-    order = np.lexsort((values, cell))
+    order = xp.lexsort(xp.stack((values, cell)))
     sorted_values = values[order]
-    counts = np.bincount(cell[order], minlength=n_cells)
-    starts = np.concatenate(([0], np.cumsum(counts)[:-1]))
+    counts = xp.bincount(cell[order], minlength=n_cells)
+    starts = xp.concatenate((xp.zeros(1, dtype=counts.dtype), xp.cumsum(counts)[:-1]))
     enough = counts >= max(min_points, boundary_points)
-    if not enough.any():
+    if not bool(enough.any()):
         return result
     quantile = float(np.clip(1.0 - outlier_fraction, 0.5, 1.0))
-    inside = np.floor(quantile * (counts[enough] - 1)).astype(np.int64)
-    result[enough] = sorted_values[np.clip(starts[enough] + inside,
+    inside = xp.floor(quantile * (counts[enough] - 1)).astype(xp.int64)
+    result[enough] = sorted_values[xp.clip(starts[enough] + inside,
                                            0, sorted_values.size - 1)]
     return result
 
 
-def _nanmedian_where(values: np.ndarray, axis: int) -> np.ndarray:
+def _nanmedian_where(values, axis: int, xp=np):
     """nanmedian без предупреждений на полностью пустых срезах.
 
     numpy ругается на срез из одних NaN, а такие срезы здесь нормальны: на
     высоте свода границы может не быть вовсе. Поэтому пустые срезы
     отбрасываются заранее, и медиана считается только там, где есть данные.
     """
-    out = np.full(np.delete(values.shape, axis), np.nan, dtype=np.float32)
-    has_data = np.isfinite(values).any(axis=axis)
-    if has_data.any():
-        moved = np.moveaxis(values, axis, -1)
-        out[has_data] = np.nanmedian(moved[has_data], axis=-1)
+    shape = tuple(v for i, v in enumerate(values.shape) if i != axis)
+    out = xp.full(shape, xp.nan, dtype=xp.float32)
+    has_data = xp.isfinite(values).any(axis=axis)
+    if bool(has_data.any()):
+        moved = xp.moveaxis(values, axis, -1)
+        out[has_data] = xp.nanmedian(moved[has_data], axis=-1)
     return out
 
 
-def _drop_unsupported_slices(width: np.ndarray, band: np.ndarray, n_bands: int,
-                             cfg: TunnelConfig, min_support: float) -> np.ndarray:
+def _drop_unsupported_slices(width, band, n_bands: int,
+                             cfg: TunnelConfig, min_support: float, xp=np):
     """Убирает слои, где «граница» встречается лишь в единичных полосах.
 
     Это и есть отличие обделки от предмета: стена, лоток и край платформы
@@ -144,7 +146,7 @@ def _drop_unsupported_slices(width: np.ndarray, band: np.ndarray, n_bands: int,
     занимает одну-две. Если слой высоты заполнен лишь местами, значит на этой
     высоте границы нет вовсе — и ограничивать там нечего.
     """
-    per_band = np.bincount(band, minlength=n_bands)
+    per_band = xp.bincount(band, minlength=n_bands)
     # «Полоса с данными» — не та, где есть хоть что-то, а та, где точек хватает
     # на описание сечения. Иначе дальние полосы, куда дошло по десятку
     # отражений, считаются полноценными: слой высоты в них пуст, поддержка
@@ -153,41 +155,41 @@ def _drop_unsupported_slices(width: np.ndarray, band: np.ndarray, n_bands: int,
     # кадра, а не числом: у 64- и 128-луча она различается в три раза.
     filled = per_band[per_band > 0]
     threshold = max(cfg.min_cell_points,
-                    int(cfg.band_density_fraction * np.median(filled)) if filled.size else 0)
+                    int(cfg.band_density_fraction * float(to_host(xp.median(filled))))
+                    if filled.size else 0)
     with_data = per_band >= threshold
     n_eff = int(with_data.sum())
     if n_eff == 0:
         return width
-    support = np.isfinite(width[with_data]).sum(axis=0) / float(n_eff)
+    support = xp.isfinite(width[with_data]).sum(axis=0) / float(n_eff)
     unsupported = support < min_support
-    if unsupported.any():
-        width[:, unsupported] = np.nan
+    if bool(unsupported.any()):
+        width[:, unsupported] = xp.nan
     return width
 
 
-def _smooth_along_bands(width: np.ndarray, radius: int) -> np.ndarray:
+def _smooth_along_bands(width, radius: int, xp=np):
     """Скользящая медиана по полосам дальности с игнорированием пустых ячеек.
 
     Предмет закрывает собой обделку в своей полосе и занижает там измеренную
     ширину; медиана по соседним полосам возвращает ту границу, которая есть в
-    действительности.
+    действительности. Считается сдвигами (см. lib/backend.py): представление
+    с произвольными шагами есть не во всех версиях cupy, а сдвиг работает
+    одинаково на обоих бэкендах.
     """
     if radius <= 0:
         return width
-    padded = np.pad(width, ((radius, radius), (0, 0), (0, 0)),
-                    mode="constant", constant_values=np.nan)
-    windows = np.lib.stride_tricks.sliding_window_view(padded, 2 * radius + 1, axis=0)
-    smoothed = _nanmedian_where(windows, axis=-1)
+    smoothed = sliding_median(width, radius, xp)
     # Полосы, где данных нет даже в окне, добираем медианой слоя по всему кадру:
     # тоннель вдоль пути однороден, и одна цифра на слой лучше, чем ничего.
-    fallback = _nanmedian_where(width, axis=0)
-    empty = np.isnan(smoothed)
-    if empty.any():
-        smoothed[empty] = np.broadcast_to(fallback, smoothed.shape)[empty]
-    return smoothed.astype(np.float32)
+    fallback = _nanmedian_where(width, axis=0, xp=xp)
+    empty = xp.isnan(smoothed)
+    if bool(empty.any()):
+        smoothed = xp.where(empty, xp.broadcast_to(fallback, smoothed.shape), smoothed)
+    return smoothed.astype(xp.float32)
 
 
-def _boundary_noise(width: np.ndarray) -> float:
+def _boundary_noise(width, xp=np) -> float:
     """Собственная неровность границы: разброс ширины между соседними полосами.
 
     Обделка не гладкая, а на дальней полосе от неё приходят единицы
@@ -198,16 +200,16 @@ def _boundary_noise(width: np.ndarray) -> float:
     """
     if width.shape[0] < 2:
         return 0.0
-    diff = np.abs(np.diff(width, axis=0))
-    finite = diff[np.isfinite(diff)]
+    diff = xp.abs(xp.diff(width, axis=0))
+    finite = diff[xp.isfinite(diff)]
     if finite.size == 0:
         return 0.0
-    return float(np.median(finite))
+    return float(to_host(xp.median(finite)))
 
 
-def estimate_free_space(x: np.ndarray, lateral: np.ndarray, height: np.ndarray,
+def estimate_free_space(x, lateral, height,
                         cfg: TunnelConfig, x_max: float,
-                        max_object_length: float = 8.0) -> Optional[FreeSpace]:
+                        max_object_length: float = 8.0, xp=np) -> Optional[FreeSpace]:
     """Строит модель свободного пространства по облаку одного кадра.
 
     `lateral` и `height` — поперечное смещение от оси пути и высота над УГР,
@@ -232,28 +234,30 @@ def estimate_free_space(x: np.ndarray, lateral: np.ndarray, height: np.ndarray,
     if n_bands <= 0 or n_slices <= 0:
         return None
 
-    band = np.floor((x - cfg.x_min) / band_len).astype(np.int64)
-    sl = np.floor((height - cfg.height_min) / cfg.slice_height).astype(np.int64)
+    band = xp.floor((x - cfg.x_min) / band_len).astype(xp.int64)
+    sl = xp.floor((height - cfg.height_min) / cfg.slice_height).astype(xp.int64)
     keep = (band >= 0) & (band < n_bands) & (sl >= 0) & (sl < n_slices)
     if int(keep.sum()) < cfg.min_cell_points:
         return None
     band, sl = band[keep], sl[keep]
     lat = lateral[keep]
-    side = np.where(lat >= 0.0, LEFT, RIGHT).astype(np.int64)
-    cell = ((band * n_slices + sl) * 2 + side).astype(np.int64)
+    side = xp.where(lat >= 0.0, LEFT, RIGHT).astype(xp.int64)
+    cell = ((band * n_slices + sl) * 2 + side).astype(xp.int64)
 
-    raw = _cell_boundary(np.abs(lat).astype(np.float32), cell, n_bands * n_slices * 2,
+    raw = _cell_boundary(xp.abs(lat).astype(xp.float32), cell, n_bands * n_slices * 2,
                          cfg.boundary_points, cfg.min_cell_points,
-                         cfg.outlier_fraction)
+                         cfg.outlier_fraction, xp)
     width = raw.reshape(n_bands, n_slices, 2)
     support = cfg.min_band_support if cfg.min_band_support is not None \
         else support_threshold(max_object_length, band_len, n_bands)
-    width = _drop_unsupported_slices(width, band, n_bands, cfg, support)
-    filled = int(np.isfinite(width).sum())
+    width = _drop_unsupported_slices(width, band, n_bands, cfg, support, xp)
+    filled = int(xp.isfinite(width).sum())
     if filled == 0:
         return None
-    noise = _boundary_noise(width)
-    width = _smooth_along_bands(width, cfg.smooth_bands)
-    return FreeSpace(width=width, x_min=cfg.x_min, band=band_len,
+    noise = _boundary_noise(width, xp)
+    width = _smooth_along_bands(width, cfg.smooth_bands, xp)
+    # Сетка возвращается в память процессора: она мала (полосы x слои x две
+    # стороны), а спрашивают её точки-кандидаты, которые считаются там же.
+    return FreeSpace(width=to_host(width), x_min=cfg.x_min, band=band_len,
                      h_min=cfg.height_min, slice_h=cfg.slice_height, filled_cells=filled,
                      boundary_noise=noise)

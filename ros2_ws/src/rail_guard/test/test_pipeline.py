@@ -951,3 +951,84 @@ def test_brake_requires_entering_the_body_gauge():
     # Зашёл в габарит кузова — полноценная реакция.
     inside = decide([track_at(-0.6)], 12.0, 120.0, cfg, speed_measured=True, safety_margin=0.25)
     assert inside.action > ACTION_ATTENTION, inside.reason
+
+
+# ─────────────────────────────── выбор вычислительного бэкенда
+
+def test_backend_falls_back_to_cpu_without_cupy():
+    """Без видеокарты тракт обязан работать, а не падать."""
+    from rail_guard.lib.backend import select_backend
+
+    cpu = select_backend("cpu")
+    assert not cpu.on_gpu and cpu.xp is np
+    # auto на машине без cupy тоже обязан дать рабочий бэкенд с причиной.
+    auto = select_backend("auto")
+    assert auto.xp is not None
+    if not auto.on_gpu:
+        assert auto.reason, "причина отказа от видеокарты должна быть названа"
+
+
+def test_pipeline_survives_gpu_failure():
+    """Отказ устройства в работе переводит тракт на процессор, не роняя кадр."""
+    cfg = PipelineConfig()
+    pipeline = Pipeline(cfg)
+
+    class Exploding:
+        """Бэкенд, который падает на первой же операции."""
+        def __getattr__(self, name):
+            raise RuntimeError("устройство отвалилось")
+
+    from rail_guard.lib.backend import Backend
+    pipeline.backend = Backend(name="gpu", xp=Exploding(), device_name="тест")
+    pipeline.frames._set_matrix(np.eye(3, dtype=np.float32), "вперёд x, вверх z", "тест")
+
+    result = pipeline.process(synthetic_scene(), None, timestamp=0.1)
+    assert result is not None
+    assert not pipeline.backend.on_gpu, "после отказа должен остаться процессор"
+    assert pipeline.gpu_fallback, "причина отказа должна быть записана"
+
+
+def test_backend_stages_agree_on_cpu():
+    """Этапы, вынесенные на устройство, дают тот же ответ с любым модулем.
+
+    Здесь оба прогона идут на numpy: проверяется, что параметризация по `xp`
+    ничего не сломала. Совпадение с настоящей видеокартой проверяется на
+    железе скриптом scripts/check_gpu.py — синтетика для этого не годится.
+    """
+    from rail_guard.lib.preprocess import preprocess
+    from rail_guard.lib.scene import classify_scene
+    from rail_guard.lib.tunnel import estimate_free_space
+
+    cfg = config()
+    cloud = tunnel_walls(synthetic_scene(length=80.0), length=120.0)
+    first = preprocess(cloud, None, cfg.preprocess)[0]
+    second = preprocess(cloud, None, cfg.preprocess, xp=np)[0]
+    assert np.array_equal(first, second)
+
+    x, lateral, height = tunnel_cloud()
+    a = classify_scene(x, lateral, height, gauge_height=3.75, corridor_half_width=1.65)
+    b = classify_scene(x, lateral, height, gauge_height=3.75, corridor_half_width=1.65, xp=np)
+    assert (a.kind, round(a.half_width, 3)) == (b.kind, round(b.half_width, 3))
+
+    free_a = estimate_free_space(x, lateral, height, cfg.tunnel, 120.0)
+    free_b = estimate_free_space(x, lateral, height, cfg.tunnel, 120.0, xp=np)
+    assert (free_a is None) == (free_b is None)
+    if free_a is not None:
+        assert np.allclose(free_a.width, free_b.width, equal_nan=True)
+
+
+def test_latency_enters_braking_distance():
+    """Задержка решения удлиняет тормозной путь — иначе он занижен.
+
+    За время от съёмки кадра до команды поезд проезжает v·t, и эти метры
+    физически отнимаются от запаса на остановку.
+    """
+    from rail_guard.lib.decision import braking_distance, safe_speed
+
+    cfg = config().decision
+    instant = braking_distance(20.0, cfg, emergency=True)
+    delayed = braking_distance(20.0, cfg, emergency=True, extra_delay=0.15)
+    assert delayed > instant
+    assert delayed - instant == pytest.approx(20.0 * 0.15, rel=1e-6)
+    # Допустимая скорость при той же дальности от задержки только падает.
+    assert safe_speed(100.0, cfg, extra_delay=0.15) < safe_speed(100.0, cfg)

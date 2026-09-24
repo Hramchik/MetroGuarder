@@ -48,25 +48,37 @@ class GaugeDecision:
     confident_range: float = 0.0
     max_safe_speed: float = 0.0
     speed_limited: bool = False
+    # Задержка, с которой это решение получено: от съёмки кадра до команды.
+    # Входит в тормозной путь наравне с временем срабатывания тормозов.
+    latency: float = 0.0
 
     @property
     def action_name(self) -> str:
         return ACTION_NAMES.get(self.action, "?")
 
 
-def braking_distance(speed: float, cfg: DecisionConfig, emergency: bool = True) -> float:
+def braking_distance(speed: float, cfg: DecisionConfig, emergency: bool = True,
+                     extra_delay: float = 0.0) -> float:
+    """Тормозной путь с учётом задержки, с которой пришло само решение.
+
+    `extra_delay` — сколько прошло от съёмки кадра до команды: транспорт,
+    обработка, публикация. За это время поезд уже проехал, и не учитывать
+    его — значит считать тормозной путь короче настоящего. Ровно поэтому
+    задержка тракта меряется, а не предполагается.
+    """
     decel = cfg.emergency_decel if emergency else cfg.service_decel
-    return speed * cfg.reaction_time + (speed * speed) / (2.0 * max(decel, 0.1))
+    delay = cfg.reaction_time + max(extra_delay, 0.0)
+    return speed * delay + (speed * speed) / (2.0 * max(decel, 0.1))
 
 
-def safe_speed(distance: float, cfg: DecisionConfig) -> float:
+def safe_speed(distance: float, cfg: DecisionConfig, extra_delay: float = 0.0) -> float:
     """Скорость, с которой поезд успевает остановиться в пределах distance.
 
     Обратная задача к braking_distance: из d = v*t + v^2/(2a) при
     положительном корне v = -a*t + sqrt((a*t)^2 + 2*a*d).
     """
     a = max(cfg.emergency_decel, 0.1)
-    at = a * cfg.reaction_time
+    at = a * (cfg.reaction_time + max(extra_delay, 0.0))
     return float(max(0.0, -at + (at * at + 2.0 * a * max(distance, 0.0)) ** 0.5))
 
 
@@ -91,18 +103,18 @@ def _kinematic_split(strong: List[ObjectTrack], speed: float,
 def decide(tracks: List[ObjectTrack], speed: Optional[float], detection_range: float,
            cfg: DecisionConfig, speed_measured: bool = False,
            confident_range: Optional[float] = None,
-           safety_margin: float = 0.0) -> GaugeDecision:
+           safety_margin: float = 0.0, latency: float = 0.0) -> GaugeDecision:
     """`safety_margin` — боковой запас габарита (раскачка кузова, погрешность
     оси). Объект, зашедший только в него, поезд физически ещё не задевает:
     это повод снизить скорость и разобраться, а не рвать стоп-кран. Торможение
     выдаётся по тому, что вошло в габарит самого кузова."""
     v = cfg.default_speed if speed is None else max(0.0, float(speed))
-    d_emergency = braking_distance(v, cfg, emergency=True)
-    d_service = braking_distance(v, cfg, emergency=False)
+    d_emergency = braking_distance(v, cfg, emergency=True, extra_delay=latency)
+    d_service = braking_distance(v, cfg, emergency=False, extra_delay=latency)
     # Зона, в которой положение пути подтверждено рельсами: за ней ось ведёт
     # обделка тоннеля, и экстренное торможение по такому объекту не выдаётся.
     confident = detection_range if confident_range is None else float(confident_range)
-    v_safe = safe_speed(confident, cfg)
+    v_safe = safe_speed(confident, cfg, extra_delay=latency)
     over_speed = bool(cfg.speed_limit_enabled and speed_measured
                       and v > v_safe + cfg.speed_limit_tolerance)
     speed_note = (f"; обзор достоверен на {confident:.0f} м — это не больше "
@@ -138,7 +150,8 @@ def decide(tracks: List[ObjectTrack], speed: Optional[float], detection_range: f
             braking_distance=d_emergency, detection_range=detection_range,
             reason="габарит свободен" + (speed_note.replace("; обзор", ", обзор", 1)
                                          if over_speed else ""),
-            confident_range=confident, max_safe_speed=v_safe, speed_limited=over_speed)
+            confident_range=confident, max_safe_speed=v_safe, speed_limited=over_speed,
+            latency=latency)
 
     if not strong:
         # Объект есть, но либо он на дальности, где положение оси пути уже
@@ -170,7 +183,8 @@ def decide(tracks: List[ObjectTrack], speed: Optional[float], detection_range: f
                              nearest_id=nearest.id, obstacle_count=len(weak),
                              braking_distance=d_emergency, detection_range=detection_range,
                              reason=reason + speed_note, confident_range=confident,
-                             max_safe_speed=v_safe, speed_limited=over_speed)
+                             max_safe_speed=v_safe, speed_limited=over_speed,
+                             latency=latency)
 
     nearest = min(strong, key=lambda t: t.detection.distance)
     d = nearest.detection.distance
@@ -204,4 +218,5 @@ def decide(tracks: List[ObjectTrack], speed: Optional[float], detection_range: f
                          nearest_id=nearest.id, obstacle_count=len(strong) + len(weak),
                          braking_distance=d_emergency, detection_range=detection_range,
                          reason=reason + speed_note, confident_range=confident,
-                         max_safe_speed=v_safe, speed_limited=over_speed)
+                         max_safe_speed=v_safe, speed_limited=over_speed,
+                         latency=latency)

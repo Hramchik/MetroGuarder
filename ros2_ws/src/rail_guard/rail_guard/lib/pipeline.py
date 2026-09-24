@@ -13,6 +13,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from .backend import Backend, select_backend, to_device, to_host
 from .cluster import cluster
 from .config import PipelineConfig
 from .decision import GaugeDecision, decide
@@ -63,6 +64,9 @@ class FrameResult:
     sensor_profile: Optional[SensorProfile] = None
     scene: Optional[SceneModel] = None
     detection_limit: float = 0.0
+    # Где считался кадр и с какой задержкой пришло решение.
+    backend: str = "процессор"
+    latency: float = 0.0
     # Для отладочной визуализации (заполняются только при debug=True)
     filtered_xyz: Optional[np.ndarray] = None
     candidate_xyz: Optional[np.ndarray] = None
@@ -84,6 +88,11 @@ class Pipeline:
         # сечения, `derive` превращает то и другое в рабочие пороги. Базовый
         # конфиг при этом не меняется: в нём видно, что задал человек, а в
         # `eff` — с чем тракт работает на самом деле.
+        # Где считать поэлементные этапы. Отказ видеокарты переводит тракт на
+        # процессор и не останавливает работу — см. lib/backend.py.
+        self.backend = select_backend(self.cfg.compute.device)
+        self.backend_note = self.backend.describe()
+        self.gpu_fallback: str = ""
         self.sensor = SensorCalibrator(sensor_sector(self.cfg))
         self.scene = SceneTracker(self.cfg.scene.window)
         self.derive = DerivedResolver(self.cfg)
@@ -115,6 +124,30 @@ class Pipeline:
         # настройку под конкретную модель лидара.
         self._last_raw_points = 0
         self._density_step = 0
+
+    def _frame_xp(self, n_points: int):
+        """Модуль массивов для этого кадра.
+
+        Видеокарта берётся только когда ориентация датчика уже определена (её
+        определение идёт по подвыборке на процессоре и делается один раз) и
+        когда кадр достаточно велик, чтобы перенос окупился.
+        """
+        if not self.backend.on_gpu or not self.frames.resolved:
+            return np
+        if n_points < self.cfg.compute.min_points_for_gpu:
+            return np
+        return self.backend.xp
+
+    def _drop_to_cpu(self, stage: str, exc: Exception) -> None:
+        """Переводит тракт на процессор после отказа видеокарты — навсегда.
+
+        Повторять попытки нельзя: если устройство отвалилось или кончилась
+        память, каждая следующая попытка стоит кадра, а кадр — это метры
+        тормозного пути.
+        """
+        self.backend = Backend(name="cpu", reason=f"отказ на этапе «{stage}»")
+        self.gpu_fallback = f"{stage}: {type(exc).__name__}: {exc}"
+        self.backend_note = self.backend.describe()
 
     @property
     def density_budget(self) -> int:
@@ -301,7 +334,15 @@ class Pipeline:
                 frames)
 
     def process(self, xyz: np.ndarray, intensity: Optional[np.ndarray] = None,
-                timestamp: Optional[float] = None, ego_speed: Optional[float] = None) -> FrameResult:
+                timestamp: Optional[float] = None, ego_speed: Optional[float] = None,
+                arrival_delay: float = 0.0) -> FrameResult:
+        """Обрабатывает кадр и принимает решение.
+
+        `arrival_delay` — сколько прошло от съёмки кадра до его попадания
+        сюда (транспорт, очередь, разбор сообщения). Вместе со временем самой
+        обработки это и есть задержка, с которой команда доходит до тормозов;
+        она входит в тормозной путь, поэтому её меряют, а не угадывают.
+        """
         # Рабочий конфиг прошлого кадра: ранние этапы (прореживание, обрезка
         # рабочей зоны) идут до того, как этот кадр что-то расскажет о датчике
         # и сцене. Параметры меняются медленно, и отставание на кадр здесь
@@ -328,20 +369,41 @@ class Pipeline:
             # чтобы сойтись за несколько кадров, и достаточно мелко, чтобы не
             # обрушить дальность одним движением.
             self._density_step = max(raw_points // 8, 10000)
-        xyz, intensity = limit_input(xyz, intensity, cfg.preprocess, self.frames.axes,
-                                     max_points=self._density_budget)
-        xyz, frame_decided = self.frames.apply(xyz)
+        source_xyz, source_intensity = xyz, intensity
+        xp = self._frame_xp(raw_points)
+        try:
+            if xp is not np:
+                xyz = to_device(xyz, self.backend)
+                intensity = to_device(intensity, self.backend)
+            xyz, intensity = limit_input(xyz, intensity, cfg.preprocess, self.frames.axes,
+                                         max_points=self._density_budget, xp=xp)
+            xyz, frame_decided = self.frames.apply(xyz, xp=xp)
+        except Exception as exc:                      # pragma: no cover — отказ устройства
+            self._drop_to_cpu("фильтрация", exc)
+            xp = np
+            xyz, intensity = limit_input(source_xyz, source_intensity, cfg.preprocess,
+                                         self.frames.axes, max_points=self._density_budget)
+            xyz, frame_decided = self.frames.apply(xyz)
         # Датчик меряется по развёрнутому облаку: передний сектор, в котором
-        # считается плотность лучей, определён в рабочей СК.
+        # считается плотность лучей, определён в рабочей СК. Меряется редко,
+        # поэтому кадр для этого возвращается в память процессора.
         if self.frames.resolved:
-            self.sensor.update(xyz)
+            self.sensor.update(to_host(xyz))
         cfg = self.eff = self.derive.update(self.sensor.profile, self.scene.current)
         timings["frames_ms"] = (time.perf_counter() - t0) * 1e3
 
         # 2. Фильтрация (с потолком на размер облака — по бюджету времени)
         t0 = time.perf_counter()
         used_points = int(xyz.shape[0])
-        pts, inten, _kept = preprocess(xyz, intensity, cfg.preprocess)
+        try:
+            pts, inten, _kept = preprocess(xyz, intensity, cfg.preprocess, xp=xp)
+        except Exception as exc:                      # pragma: no cover — отказ устройства
+            self._drop_to_cpu("фильтрация", exc)
+            xp = np
+            pts, inten, _kept = preprocess(to_host(xyz), to_host(intensity), cfg.preprocess)
+        # Дальше тракт работает в памяти процессора: оценка полотна и оси
+        # пути итеративны, кластеризация и сопровождение — по сотням точек.
+        pts, inten = to_host(pts), to_host(inten)
         timings["preprocess_ms"] = (time.perf_counter() - t0) * 1e3
         degenerate = bool(
             used_points >= cfg.sensor.auto_min_points
@@ -405,9 +467,24 @@ class Pipeline:
         #    работают ли тоннельные механизмы — и решает это кадр, а не
         #    профиль, написанный до поездки.
         t0 = time.perf_counter()
+        # Два оставшихся этапа на устройстве работают с одними и теми же тремя
+        # столбцами — дальностью, поперечным смещением и высотой, — поэтому
+        # переносятся один раз на оба.
+        scene_xp = self._frame_xp(pts.shape[0] * 3)
+        dev_x = dev_lateral = dev_heights = None
+        if scene_xp is not np:
+            try:
+                dev_x = to_device(pts[:, 0], self.backend)
+                dev_lateral = to_device(lateral, self.backend)
+                dev_heights = to_device(heights, self.backend)
+            except Exception as exc:                  # pragma: no cover — отказ устройства
+                self._drop_to_cpu("перенос кадра", exc)
+                scene_xp = np
         if cfg.scene.enabled and pts.shape[0]:
+            scene_args = (dev_x, dev_lateral, dev_heights) if scene_xp is not np \
+                else (pts[:, 0], lateral, heights)
             self.scene.update(classify_scene(
-                pts[:, 0], lateral, heights,
+                *scene_args,
                 gauge_height=cfg.gauge.height,
                 max_object_length=cfg.objects.max_length,
                 band=float(cfg.scene.band or 10.0),
@@ -416,7 +493,8 @@ class Pipeline:
                 search_half_width=float(cfg.scene.search_half_width or 20.0),
                 quantile=cfg.scene.quantile,
                 relevant_half_width=cfg.track.spacing,
-                corridor_half_width=cfg.gauge.half_width + cfg.gauge.lateral_margin))
+                corridor_half_width=cfg.gauge.half_width + cfg.gauge.lateral_margin,
+                xp=scene_xp))
         timings["scene_ms"] = (time.perf_counter() - t0) * 1e3
 
         # 7. Модель свободного пространства тоннеля. Строится по всему кадру,
@@ -428,10 +506,12 @@ class Pipeline:
         # стоило коридору удлиниться, как менялся набор полос, а с ним и то,
         # какие слои высоты признаются границей — вплоть до того, что стена в
         # ближней зоне перестаёт отсекаться.
+        space_args = (dev_x, dev_lateral, dev_heights) if scene_xp is not np \
+            else (pts[:, 0], lateral, heights)
         free_space = estimate_free_space(
-            pts[:, 0], lateral, heights, cfg.tunnel,
+            *space_args, cfg.tunnel,
             max(float(pts[:, 0].max()) if pts.shape[0] else 0.0, cfg.gauge.step),
-            max_object_length=cfg.objects.max_length)
+            max_object_length=cfg.objects.max_length, xp=scene_xp)
         if free_space is not None and self.cfg.objects.min_intrusion is None:
             # Порог захода внутрь свободного места — от собственного шума
             # измеренной границы: три её разброса. Меньший порог ничего не
@@ -509,10 +589,18 @@ class Pipeline:
                                         ego_speed=0.0 if speed_used is None else speed_used)
         max_range = float(pts[:, 0].max()) if pts.shape[0] else 0.0
         detection_range = min(max_range, corridor.reach)
+        # Задержка решения: путь кадра до тракта плюс время самой обработки.
+        # Время обработки берётся по медиане последних кадров, а не по
+        # текущему: решение принимается до того, как кадр досчитан, и
+        # единичный выброс не должен дёргать тормозной путь.
+        processing = 1e-3 * (float(np.median(np.asarray(self._recent_ms)))
+                             if self._recent_ms else sum(timings.values()))
+        latency = max(arrival_delay, 0.0) + processing
         decision = decide(confirmed, speed_used, detection_range, cfg.decision,
                           speed_measured=speed_used is not None,
                           confident_range=min(track.fit_range, detection_range),
-                          safety_margin=cfg.gauge.lateral_margin)
+                          safety_margin=cfg.gauge.lateral_margin,
+                          latency=latency)
         timings["track_decide_ms"] = (time.perf_counter() - t0) * 1e3
         timings["total_ms"] = (time.perf_counter() - t_start) * 1e3
         self._update_range_budget(timings["total_ms"], timestamp)
@@ -527,6 +615,7 @@ class Pipeline:
             frame_decided=frame_decided, degenerate=degenerate, free_space=free_space,
             sensor_profile=self.sensor.profile, scene=self.scene.current,
             detection_limit=detection_limit(cfg, self.sensor.profile),
+            backend=self.backend_note, latency=latency,
         )
         if cfg.debug:
             result.filtered_xyz = pts

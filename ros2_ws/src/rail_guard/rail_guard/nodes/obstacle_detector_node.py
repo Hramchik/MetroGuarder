@@ -274,8 +274,14 @@ class ObstacleDetectorNode(Node):
             near_limit=self.pipeline.eff.preprocess.decimate_below,
             want_intensity=self.pipeline.eff.preprocess.min_intensity_far > 0.0)
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        # Сколько кадр шёл до нас: съёмка, транспорт, очередь, разбор. Это
+        # часть задержки, с которой команда дойдёт до тормозов, и она входит
+        # в тормозной путь наравне со временем обработки.
+        now = self.get_clock().now().nanoseconds * 1e-9
+        arrival_delay = now - stamp if 0.0 < now - stamp < 5.0 else 0.0
         result = self.pipeline.process(xyz, intensity, timestamp=stamp,
-                                       ego_speed=self._current_speed())
+                                       ego_speed=self._current_speed(),
+                                       arrival_delay=arrival_delay)
         if not self._clouds_seen:
             self._stop_discovery()
             self._stop_fallback_timer()
@@ -398,6 +404,8 @@ class ObstacleDetectorNode(Node):
                               else self.cfg.decision.default_speed)
         msg.speed_source = result.speed_source
         msg.detection_limit = float(result.detection_limit)
+        msg.decision_latency = float(result.latency)
+        msg.compute_backend = result.backend
         msg.beam_density = float(result.sensor_profile.points_per_sr
                                  if result.sensor_profile else 0.0)
         msg.scene = result.scene.kind if result.scene else "unknown"
